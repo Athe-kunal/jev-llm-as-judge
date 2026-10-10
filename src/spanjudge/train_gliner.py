@@ -81,18 +81,25 @@ def to_example(row: dict[str, Any]) -> dict[str, Any]:
 def split(
     rows: list[dict[str, Any]], eval_share: float, seed: int
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Held-out rows per source; rows of the same response stay together."""
+    """Held-out rows per source, split by context (prompt or document).
+
+    Several responses share a context (RAGTruth models on one document,
+    PRM800K solutions to one problem, MQM systems on one sentence, normal
+    and careless answers to one prompt), so every row of a context goes to
+    the same side.
+    """
     rng = random.Random(seed)
-    by_source: dict[str, list] = collections.defaultdict(list)
+    contexts: dict[str, set] = collections.defaultdict(set)
     for r in rows:
-        by_source[r["source"]].append(r)
+        contexts[r["source"]].add(r["context"])
+    held_contexts = set()
+    for source in sorted(contexts):
+        pool = sorted(contexts[source])
+        rng.shuffle(pool)
+        held_contexts.update(pool[: max(1, int(len(pool) * eval_share))])
     train, held = [], []
-    for source_rows in by_source.values():
-        responses = sorted({r["response"] for r in source_rows})
-        rng.shuffle(responses)
-        cut = set(responses[: max(1, int(len(responses) * eval_share))])
-        for r in source_rows:
-            (held if r["response"] in cut else train).append(r)
+    for r in rows:
+        (held if r["context"] in held_contexts else train).append(r)
     rng.shuffle(train)
     return train, held
 

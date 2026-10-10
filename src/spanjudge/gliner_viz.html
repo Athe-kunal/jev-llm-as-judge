@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Span judge model</title>
+<style>
+:root{--bg:#f6f6f4;--panel:#fff;--ink:#1d1d1b;--ink2:#55544f;--mute:#8d8c85;--line:#e2e1dc;
+--blue:#2a78d6;--orange:#eb6834;--green:#1baf7a;--red:#e34948;--hl:235,104,52}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#121211;--panel:#1a1a19;--ink:#f3f3f1;--ink2:#c3c2b7;--mute:#8d8c85;--line:#2d2d2b;
+--blue:#3987e5;--orange:#d95926;--green:#199e70;--red:#e66767;--hl:217,89,38}}
+:root[data-theme=dark]{--bg:#121211;--panel:#1a1a19;--ink:#f3f3f1;--ink2:#c3c2b7;--mute:#8d8c85;--line:#2d2d2b;
+--blue:#3987e5;--orange:#d95926;--green:#199e70;--red:#e66767;--hl:217,89,38}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+header{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+h1{font-size:16px;margin:0 12px 0 0}h2{font-size:14px;margin:14px 0 6px}
+main{padding:12px 16px;max-width:1200px;margin:0 auto}
+.pill{font-size:12px;padding:2px 8px;border-radius:99px;border:1px solid var(--line);color:var(--ink2);white-space:nowrap}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;margin-bottom:12px}
+.text{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid var(--line);border-radius:6px;padding:10px;font-size:13px;background:var(--bg)}
+.num{color:var(--ink2);font-size:12px}.ok{color:var(--green)}.bad{color:var(--red)}
+.hu{border-bottom:3px solid var(--blue)}
+.callout{border-left:3px solid var(--blue);padding:6px 10px;background:var(--bg);border-radius:0 6px 6px 0}
+details{margin:6px 0}summary{cursor:pointer;color:var(--ink2)}
+select,button,input{font:inherit}
+select,button{background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:3px 8px}
+button.primary{background:var(--ink);color:var(--panel);border-color:var(--ink);cursor:pointer}
+button{cursor:pointer}
+.controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media (max-width:800px){.grid{grid-template-columns:1fr}}
+.row{display:flex;align-items:center;gap:8px;margin:3px 0}.row .k{width:90px;font-size:12px}
+.bar{height:10px;background:var(--mute);border-radius:2px}.bar.top{background:var(--orange)}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid var(--line);padding:4px 6px;text-align:left;vertical-align:top}
+th{color:var(--ink2);font-weight:600}.n{text-align:right;font-variant-numeric:tabular-nums}
+.big{font-size:18px;font-weight:600}
+.legend span{margin-right:12px}
+</style></head><body>
+<header><h1>Span judge model</h1><span class="pill" id="meta">loading…</span><span class="pill" id="timing"></span></header>
+<main>
+<div class="card controls">
+  <select id="src"><option value="">all datasets</option></select>
+  <select id="lab"><option value="">all gold labels</option></select>
+  <button class="primary" id="go">Random example</button>
+  <label class="num">span threshold <input type="range" id="thr" min="0.05" max="0.95" step="0.05" value="0.5"> <b id="thrv">0.50</b></label>
+  <button id="reload" title="Copy the latest best checkpoint from the run and load it">Reload checkpoint</button>
+</div>
+<div id="view"><div class="card">Pick a dataset or press <b>Random example</b>.</div></div>
+</main>
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const f=(x,d=2)=>typeof x==='number'?x.toFixed(d):'–';
+let D=null;
+
+async function meta(){
+  const m=await (await fetch('/api/meta')).json();
+  $('#meta').textContent=`${m.run} · checkpoint loaded ${m.loaded_at} · ${m.rows} held-out rows`;
+  if($('#src').options.length===1){
+    m.sources.forEach(s=>$('#src').insertAdjacentHTML('beforeend',`<option>${esc(s)}</option>`));
+    m.labels.forEach(s=>$('#lab').insertAdjacentHTML('beforeend',`<option>${esc(s)}</option>`));
+  }
+}
+
+// gold spans: blue underline; predicted spans: orange fill, stronger = higher score
+function overlay(text,gold,pred){
+  const cuts=new Set([0,text.length]);[...gold,...pred].forEach(s=>{cuts.add(s.start);cuts.add(s.end)});
+  const c=[...cuts].sort((a,b)=>a-b);let o='';
+  for(let i=0;i<c.length-1;i++){const a=c[i],b=c[i+1];if(a>=b)continue;
+    const g=gold.some(s=>s.start<=a&&b<=s.end);
+    const p=pred.filter(s=>s.start<=a&&b<=s.end).reduce((m,s)=>Math.max(m,s.score),0);
+    const style=p?`background:rgba(var(--hl),${(0.18+0.6*p).toFixed(2)});border-radius:2px`:'';
+    const t=esc(text.slice(a,b));
+    o+=(g||p)?`<span class="${g?'hu':''}" style="${style}" ${p?`title="model score ${p.toFixed(2)}"`:''}>${t}</span>`:t}
+  return o}
+
+function overlapF1(text,gold,pred){ // character-level, within the response
+  const G=new Set(),P=new Set();gold.forEach(s=>{for(let i=s.start;i<s.end;i++)G.add(i)});pred.forEach(s=>{for(let i=s.start;i<s.end;i++)P.add(i)});
+  if(!G.size&&!P.size)return null;let tp=0;P.forEach(i=>{if(G.has(i))tp++});
+  const p=P.size?tp/P.size:0,r=G.size?tp/G.size:0;return {p,r,f1:p+r?2*p*r/(p+r):0}}
+
+function render(){
+  if(!D)return;if(D.error){$('#view').innerHTML=`<div class="card">${esc(D.error)}</div>`;return}
+  const r=D.row,p=D.pred,thr=+$('#thr').value;
+  const pred=p.spans.filter(s=>s.score>=thr);
+  const right=p.label===r.label, ov=overlapF1(r.response,r.spans,pred);
+  const labels=Object.keys(r.labels);const mx=Math.max(...labels.map(k=>p.label_scores[k]||0),1e-9);
+  $('#timing').textContent=`row #${D.idx} · inference ${D.ms} ms`;
+  $('#view').innerHTML=`
+  <div class="card"><div class="num">${esc(r.source)} · ${esc(r.question_type)} · ${r.related?'related question':'unrelated question (expected label: unrelated)'}</div>
+    <div class="callout"><b>${esc(r.question)}</b>
+    <details><summary>labels</summary>${labels.map(k=>`<div class="num"><code>${esc(k)}</code> ${esc(r.labels[k])}</div>`).join('')}</details></div></div>
+  <div class="grid">
+    <div class="card"><h2 style="margin-top:0">Label</h2>
+      <div class="big">model: <span class="${right?'ok':'bad'}">${esc(p.label)}</span> <span class="num">(${f(p.confidence)})</span></div>
+      <div>gold: <b>${esc(r.label)}</b> <span class="num">(${esc(r.label_from)})</span> ${right?'<span class="ok">✓ match</span>':'<span class="bad">✗ mismatch</span>'}</div>
+      <div class="num" style="margin-top:8px">per-label scores (independent, not normalized)</div>
+      ${labels.map(k=>`<div class="row"><span class="k">${esc(k)}</span><div class="bar ${k===p.label?'top':''}" style="width:${(p.label_scores[k]||0)/mx*60}%"></div><span class="num">${f(p.label_scores[k])}</span></div>`).join('')}
+    </div>
+    <div class="card"><h2 style="margin-top:0">Spans</h2>
+      <div>gold: <b>${r.spans.length}</b> <span class="num">(${esc(r.spans_from)})</span> · model at threshold ${thr.toFixed(2)}: <b>${pred.length}</b></div>
+      <div class="num">character overlap with gold: ${ov?`P ${f(ov.p)} · R ${f(ov.r)} · <b>F1 ${f(ov.f1)}</b>`:'no spans on either side ✓'}</div>
+      ${p.spans.length?`<table style="margin-top:6px"><tr><th>model span</th><th class="n">score</th></tr>${p.spans.map(s=>`<tr style="${s.score<thr?'opacity:.45':''}"><td>${esc(s.text)}</td><td class="n">${f(s.score)}</td></tr>`).join('')}</table>`:'<div class="num" style="margin-top:6px">no candidate spans above 0.05</div>'}
+    </div>
+  </div>
+  <div class="card"><h2 style="margin-top:0">Response</h2>
+    <div class="num legend"><span class="hu">blue underline: gold spans</span><span style="background:rgba(var(--hl),.5);border-radius:2px">orange: model spans (darker = higher score)</span></div>
+    <div class="text">${overlay(r.response,r.spans,pred)}</div></div>
+  <div class="card"><details><summary>Context</summary><div class="text">${esc(r.context)}</div></details></div>`;
+}
+
+async function sample(){
+  $('#go').disabled=true;$('#go').textContent='Running…';
+  try{const q=new URLSearchParams({source:$('#src').value,label:$('#lab').value});
+    D=await (await fetch('/api/sample?'+q)).json();render()}
+  catch(e){$('#view').innerHTML='<div class="card bad">Server unreachable.</div>'}
+  $('#go').disabled=false;$('#go').textContent='Random example'}
+
+$('#go').onclick=sample;
+$('#thr').oninput=()=>{$('#thrv').textContent=(+$('#thr').value).toFixed(2);render()};
+$('#reload').onclick=async()=>{$('#reload').disabled=true;$('#reload').textContent='Reloading…';
+  await fetch('/api/reload',{method:'POST'});await meta();$('#reload').disabled=false;$('#reload').textContent='Reload checkpoint';if(D)sample()};
+document.addEventListener('keydown',e=>{if(e.key==='n'&&!/input|select/i.test(e.target.tagName))sample()});
+meta();
+</script></body></html>

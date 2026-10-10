@@ -101,7 +101,6 @@ from models whose terms limit using their outputs to train other models.
    - `report` samples each source down to its share, stratified over
      (family, label). Rows cut this way count as `over_share` in
      `left_out`.
-   - The files from before the change are in `data/mix/backup_before_topup/`.
 3. Within a source, items are drawn round-robin over (question family,
    label) so rare families and labels are kept.
 4. Unrelated items per source are in proportion to its related items.
