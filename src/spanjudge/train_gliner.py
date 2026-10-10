@@ -5,7 +5,8 @@ Usage (DDP on two GPUs; see scripts/train_gliner.sh):
       -m spanjudge.train_gliner --data data/mix/train.jsonl --out runs/gliner
 
 Each training row becomes one GLiNER2 example:
-  text: the context, then the response (spans are shifted to match).
+  text: the context, then the response (spans are shifted to match). The
+    question reaches the encoder through the classification prompt.
   classification "answer": the judge question as the prompt, the row's
     labels (with their descriptions) as the choices, the row's label as the
     answer. "unrelated" is one of the choices.
@@ -18,12 +19,16 @@ The training loop, DDP, bf16 and the boundary loss are gliner2's own
 
 import argparse
 import collections
+import dataclasses
 import json
 import os
 import random
 from typing import Any
 
 from gliner2 import AutoExtractor
+from gliner2.processor import SamplingConfig
+import torch
+from torch import distributed as dist
 from gliner2.training.trainer import ExtractorTrainer
 from gliner2.training.trainer import TrainingConfig
 
@@ -43,8 +48,42 @@ class _Trainer(ExtractorTrainer):
         super()._setup_distributed()
 
 
+def no_relabeling(processor: Any) -> None:
+    """Turns off gliner2's random rewriting of labels during training.
+
+    By default gliner2 renames labels to "label 1", "label 2", ... (and
+    "evidence" to "entity 1"), drops some labels (sometimes the true one) and
+    drops the label and entity descriptions on many rows. That teaches open
+    label sets; ours are fixed and the descriptions carry the rubric and the
+    question, so every row keeps its real labels and descriptions. Label
+    order is still shuffled.
+    """
+    processor.sampling_config = SamplingConfig(
+        remove_classification_label_prob=0.0,
+        synthetic_label_prob=0.0,
+        include_true_label_prob=1.0,
+        synthetic_entity_label_prob=0.0,
+    )
+    transform = processor._transform_schema
+
+    def with_descriptions(*args, example_mode="both", **kwargs):
+        del example_mode  # gliner2 picks it at random while training
+        return transform(*args, example_mode="descriptions", **kwargs)
+
+    processor._transform_schema = with_descriptions
+
+
+def set_cls_weight(model: Any, weight: float) -> None:
+    """Sets the label loss weight (also in the saved config)."""
+    model.boundary_settings = dataclasses.replace(
+        model.boundary_settings, classification_loss_weight=weight
+    )
+    model.config.boundary_head["classification_loss_weight"] = weight
+
+
 def to_example(row: dict[str, Any]) -> dict[str, Any]:
     """One train.jsonl row as a GLiNER2 training record."""
+    question = row["question"]
     head = f"[Context]\n{row['context']}{_SEP}"
     text = head + row["response"]
     shift = len(head)
@@ -56,7 +95,6 @@ def to_example(row: dict[str, Any]) -> dict[str, Any]:
         }
         for s in row["spans"]
     ]
-    question = row["question"]
     return {
         "input": text,
         "output": {
@@ -119,6 +157,13 @@ def main() -> None:
     parser.add_argument("--grad-ckpt", action="store_true")
     parser.add_argument("--encoder-lr", type=float, default=2e-5)
     parser.add_argument("--task-lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--cls-weight",
+        type=float,
+        default=500.0,
+        help="Label loss weight; the span losses are sums in the hundreds, "
+        "the label loss a mean below 1",
+    )
     parser.add_argument("--eval-share", type=float, default=0.03)
     parser.add_argument("--max-train", type=int, default=-1)
     parser.add_argument("--seed", type=int, default=0)
@@ -138,7 +183,15 @@ def main() -> None:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
         print(f"train {len(train_rows)} rows, eval {len(eval_rows)} rows")
 
+    backend = os.environ.get("DDP_BACKEND", "nccl")
+    if local_rank >= 0 and backend != "nccl":
+        # gliner2 only creates an NCCL group when none exists; gloo works
+        # when NCCL cannot (e.g. NVML broken by a driver mismatch).
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend=backend, init_method="env://")
     model = AutoExtractor.from_pretrained(args.model)
+    no_relabeling(model.processor)
+    set_cls_weight(model, args.cls_weight)
     config = TrainingConfig(
         output_dir=args.out,
         experiment_name="spanjudge",

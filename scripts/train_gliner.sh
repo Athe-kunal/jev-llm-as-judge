@@ -6,5 +6,6 @@ cd "$(dirname "$0")/.."
 export CUDA_VISIBLE_DEVICES="${GPUS:-2,3}"
 export PYTHONPATH=src
 export TOKENIZERS_PARALLELISM=false
-.venv-train/bin/python -m torch.distributed.run --nproc_per_node "${NPROC:-2}" \
+export DDP_BACKEND="${DDP_BACKEND:-nccl}"
+.venv/bin/python -m torch.distributed.run --nproc_per_node "${NPROC:-2}" \
   -m spanjudge.train_gliner "$@"

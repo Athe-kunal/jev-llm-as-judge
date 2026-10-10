@@ -226,8 +226,9 @@ astarag2843@gmail.com/
 data/
 archive
 
-.venv-train
 
 .claude
 
 runs
+
+models

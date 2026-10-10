@@ -12,10 +12,31 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "nvitop>=1.7.1",
+    "torch==2.9.0",
+    "torchvision==0.24.0",
+    "gliner2[train,disentangled-flash]>=2.1",
+    # Open-Jev's pinned training stack (its requirements.txt).
+    "open-jev",
+    "transformers==5.10.2",
+    "peft==0.19.1",
+    "accelerate==1.13.0",
+    "flash-linear-attention==0.5.2",  # fast Gated DeltaNet for Qwen3.5
 ]
 
 [project.optional-dependencies]
 dev = ["pytest", "hypothesis"]
+
+# CUDA 12.8 wheels: run on the 550 driver and on 580+.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+# A git checkout: Open-Jev's trainer records the source commit of each run.
+open-jev = { path = "../third_party/Open-Jev", editable = true }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
 
 [build-system]
 requires = ["setuptools>=68"]

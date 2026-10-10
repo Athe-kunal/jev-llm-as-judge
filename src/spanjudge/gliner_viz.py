@@ -1,13 +1,14 @@
 """Viewer: a trained GLiNER2 checkpoint on random held-out examples.
 
 Usage:
-  CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src .venv-train/bin/python \
+  CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src .venv/bin/python \
       -m spanjudge.gliner_viz --run runs/gliner_v1 [--port 8778]
 
 Each request draws a random row from <run>/eval_rows.jsonl (optionally by
 source or gold label), runs the checkpoint on it, and returns the gold and
-predicted label and spans. The checkpoint is a copy of <run>/best, so a
-running training job can keep overwriting best; "reload" copies it again.
+predicted label and spans. The checkpoint is a copy of <run>/best (or
+--checkpoint final), so a running training job can keep overwriting it;
+"reload" copies it again.
 """
 
 import argparse
@@ -33,8 +34,8 @@ _SPAN_FLOOR = 0.05  # spans down to this score are sent; the page filters
 class _Model:
     """The checkpoint copy, loaded on the GPU; reloads on request."""
 
-    def __init__(self, run: pathlib.Path, device: str):
-        self.run, self.device = run, device
+    def __init__(self, run: pathlib.Path, device: str, checkpoint: str):
+        self.run, self.device, self.checkpoint = run, device, checkpoint
         self.view = run.parent / f"{run.name}_view" / "model"
         self.lock = threading.Lock()
         self.model = None
@@ -45,7 +46,7 @@ class _Model:
         with self.lock:
             if self.view.exists():
                 shutil.rmtree(self.view)
-            shutil.copytree(self.run / "best", self.view)
+            shutil.copytree(self.run / self.checkpoint, self.view)
             model = AutoExtractor.from_pretrained(str(self.view))
             self.model = model.to(self.device).eval()
             self.loaded_at = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -99,14 +100,16 @@ class _Model:
         }
 
 
-def make_app(run: pathlib.Path, device: str) -> fastapi.FastAPI:
+def make_app(
+    run: pathlib.Path, device: str, checkpoint: str = "best"
+) -> fastapi.FastAPI:
     """The viewer app for one training run."""
     rows = [
         json.loads(line)
         for line in (run / "eval_rows.jsonl").read_text().splitlines()
         if line.strip()
     ]
-    model = _Model(run, device)
+    model = _Model(run, device, checkpoint)
     app = fastapi.FastAPI()
 
     @app.get("/", response_class=responses.HTMLResponse)
@@ -116,7 +119,7 @@ def make_app(run: pathlib.Path, device: str) -> fastapi.FastAPI:
     @app.get("/api/meta")
     def meta() -> dict[str, Any]:
         return {
-            "run": str(run),
+            "run": f"{run}/{checkpoint}",
             "loaded_at": model.loaded_at,
             "rows": len(rows),
             "sources": sorted({r["source"] for r in rows}),
@@ -158,8 +161,9 @@ def main() -> None:
     parser.add_argument("--run", default="runs/gliner_v1")
     parser.add_argument("--port", type=int, default=8778)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--checkpoint", default="best", help="best or final")
     args = parser.parse_args()
-    app = make_app(pathlib.Path(args.run), args.device)
+    app = make_app(pathlib.Path(args.run), args.device, args.checkpoint)
     uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
 
 
