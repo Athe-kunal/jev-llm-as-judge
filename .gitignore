@@ -218,3 +218,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Claude Code login for astarag2843@gmail.com (local credentials only)
+astarag2843@gmail.com/
+
+# pipeline outputs
+data/
+archive
+
+.venv-train
+
+.claude
+
+runs

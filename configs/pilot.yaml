@@ -1,0 +1,17 @@
+# Balanced judge-data mix; see docs/data_mix.md for the assumptions.
+data_dir: data/pilot
+seed: 0
+llm:
+  base_url: http://localhost:8011/v1
+  model: judge
+  concurrency: 128        # LLM requests in flight
+  timeout_s: 600
+item_workers: 96          # items judged at the same time
+total: 65
+unrelated_share: 0.2      # share of items whose question does not apply
+rubrichub_scan: 2000      # rows read per RubricHub file
+rubrichub_prompts: 6
+questions_per_response: 3 # questions asked of each Qwen-written response
+respond_max_tokens: 1500
+max_generated_prompts: 3
+tau: 0.05                 # a change in support larger than this counts

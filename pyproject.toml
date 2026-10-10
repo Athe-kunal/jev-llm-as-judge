@@ -1,0 +1,54 @@
+[project]
+name = "spanjudge"
+version = "0.1.0"
+description = "Span-highlighting judge: data generation pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2",
+    "openai>=1.50",
+    "pyyaml",
+    "datasets",
+    "fastapi",
+    "uvicorn",
+    "nvitop>=1.7.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "hypothesis"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+spanjudge = ["*.html"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.black]
+line-length = 80
+skip-magic-trailing-comma = true
+
+[tool.ruff]
+line-length = 80
+indent-width = 4
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "D", "N", "UP", "B"]
+ignore = ["D107", "D203", "D213"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+force-single-line = true
+force-sort-within-sections = true
+
+[tool.ruff.lint.per-file-ignores]
+# Adapters override documented abstract methods; Google style allows that.
+"src/spanjudge/sources.py" = ["D102"]
