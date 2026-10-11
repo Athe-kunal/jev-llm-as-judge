@@ -1,0 +1,16 @@
+Read the document and answer the question.
+
+{% for part in parts %}
+[{{ part.name }}]
+{{ part.text }}
+
+{% endfor %}
+[Question]
+{{ question }}
+
+Answers:
+{% for letter, desc in options %}
+{{ letter }}. {{ desc }}
+{% endfor %}
+
+Answer with the letter only.

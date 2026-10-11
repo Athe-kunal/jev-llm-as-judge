@@ -1,0 +1,18 @@
+Below is a document, a question about it, and its correct answer. One piece of the document is marked as evidence for that answer.
+
+{% for part in parts %}
+[{{ part.name }}]
+{{ part.text }}
+
+{% endfor %}
+[Question]
+{{ question }}
+
+Correct answer: {{ answer }}
+
+Evidence (in the {{ section }} section): "{{ span }}"
+
+Rewrite only the evidence so that it no longer supports the answer "{{ answer }}": change what it says, keep its style and roughly its length, and keep it fitting the text around it. Do not touch the rest of the document.
+
+Output ONLY this JSON:
+{"rewrite": "<the new text that replaces the evidence>"}

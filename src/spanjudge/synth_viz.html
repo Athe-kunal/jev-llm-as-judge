@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Span pilot review</title>
+<style>
+:root{--bg:#f6f6f4;--panel:#fff;--ink:#1d1d1b;--ink2:#55544f;--mute:#8d8c85;--line:#e2e1dc;
+--keep:27,175,122;--drop:227,73,72;--untested:141,140,133;--vote:#2a78d6;--accent:#eb6834}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#121211;--panel:#1a1a19;--ink:#f3f3f1;--ink2:#c3c2b7;--mute:#8d8c85;--line:#2d2d2b;--vote:#3987e5;--accent:#d95926}}
+:root[data-theme=dark]{--bg:#121211;--panel:#1a1a19;--ink:#f3f3f1;--ink2:#c3c2b7;--mute:#8d8c85;--line:#2d2d2b;--vote:#3987e5;--accent:#d95926}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+header{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:2}
+h1{font-size:16px;margin:0 10px 0 0}h2{font-size:13px;margin:0 0 6px;color:var(--ink2);text-transform:uppercase;letter-spacing:.04em}
+select,button,input,textarea{font:inherit;color:var(--ink)}
+select,button{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:3px 8px;cursor:pointer}
+button.on{outline:2px solid var(--accent)}
+.pill{font-size:12px;padding:2px 8px;border-radius:99px;border:1px solid var(--line);color:var(--ink2);white-space:nowrap}
+main{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:12px;padding:12px 16px;max-width:1400px;margin:0 auto}
+@media (max-width:900px){main{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;margin-bottom:12px}
+.doc{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.65;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:10px;max-height:60vh;overflow:auto}
+.sp{border-radius:3px;cursor:pointer}
+.v{text-decoration:underline;text-decoration-color:var(--vote);text-decoration-thickness:3px;text-underline-offset:3px}
+.legend{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;color:var(--ink2);margin-bottom:8px}
+.sw{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:-2px;margin-right:4px}
+.badge{font-size:11px;font-weight:600;padding:1px 6px;border-radius:4px;color:#fff}
+.k{background:rgb(var(--keep))}.d{background:rgb(var(--drop))}.u{background:rgb(var(--untested))}
+.spancard{border-left:4px solid var(--line);padding:8px 10px;margin:8px 0;background:var(--bg);border-radius:0 6px 6px 0}
+.spancard.flash{outline:2px solid var(--accent)}
+.num{color:var(--ink2);font-size:12px}.mono{font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
+.row{display:flex;align-items:center;gap:8px;margin:3px 0}.row .lab{flex:0 0 120px;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar{height:9px;background:var(--mute);border-radius:2px}.bar.gold{background:var(--accent)}
+textarea{width:100%;min-height:60px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px}
+.rv button{flex:1}.rv .good.on{background:rgb(var(--keep));color:#fff}.rv .bad.on{background:rgb(var(--drop));color:#fff}.rv .unsure.on{background:var(--mute);color:#fff}
+details summary{cursor:pointer;color:var(--ink2)}
+.q{white-space:pre-wrap}
+kbd{font-size:11px;border:1px solid var(--line);border-radius:3px;padding:0 4px;background:var(--bg)}
+</style></head><body>
+<header>
+  <h1>Span pilot review</h1>
+  <select id="src"><option value="">all sources</option></select>
+  <select id="lab"><option value="">all answers</option></select>
+  <select id="flag">
+    <option value="">all rows</option>
+    <option value="cf_dropped">counterfactual dropped a span</option>
+    <option value="disagree">vote and counterfactual disagree</option>
+    <option value="no_kept">no span kept</option>
+    <option value="p_low">Qwen doubts the gold (p&lt;0.2)</option>
+    <option value="no_spans">no spans proposed</option>
+  </select>
+  <select id="rev"><option value="">any review</option><option value="none">not reviewed</option><option value="good">good</option><option value="bad">bad</option><option value="unsure">unsure</option></select>
+  <button id="prev" title="k">◀</button><span class="pill" id="pos">–</span><button id="next" title="j">▶</button><button id="rand" title="r">random</button>
+  <span class="pill" id="prog"></span>
+</header>
+<main>
+  <div id="left"><div class="card">Loading…</div></div>
+  <div id="right"></div>
+</main>
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const f2=x=>typeof x==='number'?x.toFixed(2):'–';
+let META=null, IDX=[], POS=0, CUR=null;
+
+async function j(u,o){return (await fetch(u,o)).json()}
+async function init(){
+  META=await j('/api/meta');
+  Object.keys(META.labels).forEach(s=>$('#src').insertAdjacentHTML('beforeend',`<option>${esc(s)}</option>`));
+  try{const st=JSON.parse(localStorage.getItem('spv')||'{}');['src','flag','rev'].forEach(k=>{if(st[k]!=null)$('#'+k).value=st[k]});fillLabels();if(st.lab!=null)$('#lab').value=st.lab;POS=st.pos||0}catch(e){}
+  await refresh(true); progress();
+}
+function fillLabels(){const s=$('#src').value;const ls=s?META.labels[s]:[...new Set(Object.values(META.labels).flat())];
+  $('#lab').innerHTML='<option value="">all answers</option>'+ls.map(l=>`<option value="${esc(l)}">${esc(l.length>50?l.slice(0,50)+'…':l)}</option>`).join('')}
+function save(){try{localStorage.setItem('spv',JSON.stringify({src:$('#src').value,lab:$('#lab').value,flag:$('#flag').value,rev:$('#rev').value,pos:POS}))}catch(e){}}
+async function refresh(keep){
+  const q=new URLSearchParams({source:$('#src').value,label:$('#lab').value,flag:$('#flag').value,review:$('#rev').value});
+  IDX=(await j('/api/list?'+q)).idx; if(!keep)POS=0; POS=Math.min(POS,Math.max(IDX.length-1,0)); await show();
+}
+async function progress(){const p=await j('/api/progress');const c=p.counts;$('#prog').textContent=`reviewed ${(c.good||0)+(c.bad||0)+(c.unsure||0)}/${p.total} · good ${c.good||0} · bad ${c.bad||0} · unsure ${c.unsure||0}`}
+
+// document text with spans: background = temp-0 span verdict, underline = vote
+function overlay(part, greedy, vote){
+  const text=part.text, G=greedy.filter(s=>s.part===part.name), V=vote.filter(s=>s.part===part.name);
+  const cuts=new Set([0,text.length]);[...G,...V].forEach(s=>{cuts.add(s.start);cuts.add(s.end)});
+  const c=[...cuts].sort((a,b)=>a-b);let o='';
+  for(let i=0;i<c.length-1;i++){const a=c[i],b=c[i+1];if(a>=b)continue;
+    const gi=G.findIndex(s=>s.start<=a&&b<=s.end), v=V.some(s=>s.start<=a&&b<=s.end), t=esc(text.slice(a,b));
+    if(gi<0&&!v){o+=t;continue}
+    let style='',cls=v?'v':'',data='';
+    if(gi>=0){const s=G[gi];const col=!s.tested?'--untested':s.kept?'--keep':'--drop';style=`background:rgba(var(${col}),.28)`;cls+=' sp';data=`data-k="${greedy.indexOf(s)}"`}
+    o+=`<span class="${cls}" style="${style}" ${data}>${t}</span>`}
+  return o}
+
+function spanCard(s,k){
+  if(!s.tested) return `<div class="spancard" id="sc${k}" style="border-color:rgb(var(--untested))"><span class="badge u">NOT TESTED</span> <span class="num">${esc(s.part)}</span><div class="mono">${esc(s.text)}</div></div>`;
+  const why=[s.necessary&&'necessary',s.sufficient&&'sufficient'].filter(Boolean).join(' + ')||'neither';
+  const su=s.support;
+  return `<div class="spancard" id="sc${k}" style="border-color:rgb(var(${s.kept?'--keep':'--drop'}))">
+    <span class="badge ${s.kept?'k':'d'}">${s.kept?'KEPT':'DROPPED'}</span> <span class="num">${why} · ${esc(s.part)}</span>
+    <div class="mono" style="margin:4px 0">${esc(s.text)}</div>
+    <div class="num">${esc(s.reason||'')}</div>
+    <div style="margin-top:6px"><b>counterfactual</b> → p(gold) <b>${f2(su.counter)}</b><div class="mono">${esc(s.counter)}</div></div>
+    <div style="margin-top:4px"><b>paraphrase</b> → p(gold) <b>${f2(su.paraphrase)}</b><div class="mono">${esc(s.paraphrase)}</div></div>
+    <div class="num" style="margin-top:4px">other spans rewritten → ${f2(su.others)} · all spans rewritten → ${f2(su.all)}</div></div>`}
+
+async function show(){
+  $('#pos').textContent=IDX.length?`${POS+1} / ${IDX.length}`:'0 / 0'; save();
+  if(!IDX.length){$('#left').innerHTML='<div class="card">No rows match these filters.</div>';$('#right').innerHTML='';return}
+  const d=await j('/api/row/'+IDX[POS]); CUR=d; const x=d.row;
+  const parts=x.parts.map(p=>`<h2>${esc(p.name)}</h2><div class="doc">${overlay(p,x.greedy,x.vote)}</div>`).join('<div style="height:10px"></div>');
+  const samples=x.samples.map((ss,i)=>`<div class="num">sample ${i+1}: ${ss.map(s=>`<span class="mono">“${esc(s.text)}”</span>`).join(' · ')||'(none)'}</div>`).join('');
+  $('#left').innerHTML=`
+   <div class="card"><div class="num">${esc(x.id)} · ${esc(x.source)} · flags: ${x.flags.map(esc).join(', ')||'none'}</div>
+     <h2 style="margin-top:8px">Question</h2><div class="q">${esc(x.question)}</div></div>
+   <div class="card"><div class="legend">
+      <span><span class="sw" style="background:rgba(var(--keep),.5)"></span>temp-0 span, kept by counterfactual</span>
+      <span><span class="sw" style="background:rgba(var(--drop),.5)"></span>temp-0 span, dropped</span>
+      <span><span class="sw" style="background:rgba(var(--untested),.5)"></span>not tested</span>
+      <span><span class="v">underline</span> = vote (3 of 4 samples)</span></div>${parts}</div>
+   <div class="card"><h2>Spans and counterfactual test</h2>${x.greedy.length?x.greedy.map(spanCard).join(''):'<div class="num">No spans proposed.</div>'}
+     <details style="margin-top:8px"><summary>The 4 samples behind the vote</summary>${samples}</details></div>`;
+  const labs=Object.entries(x.labels), dist=x.dist||{};
+  $('#right').innerHTML=`
+   <div class="card"><h2>Gold answer</h2><div><b>${esc(x.label)}</b></div><div class="num">${esc(x.labels[x.label])}</div>
+     <h2 style="margin-top:10px">Qwen's answer distribution (no answer given)</h2>
+     ${labs.map(([k,v])=>`<div class="row"><span class="lab" title="${esc(v)}">${esc(k)}</span><div class="bar ${k===x.label?'gold':''}" style="width:${(dist[k]||0)*150}px"></div><span class="num">${f2(dist[k])}</span></div>`).join('')}
+     <div class="num">p(gold) = <b>${f2(x.p_gold)}</b></div></div>
+   <div class="card"><h2>Your review</h2>
+     <div class="row rv"><button class="good" data-v="good">good <kbd>1</kbd></button><button class="bad" data-v="bad">bad <kbd>2</kbd></button><button class="unsure" data-v="unsure">unsure <kbd>3</kbd></button></div>
+     <textarea id="note" placeholder="Note (optional): what is wrong or right with the spans">${esc(d.review?.note||'')}</textarea>
+     <div class="num" id="saved">${d.review?`saved ${esc(d.review.verdict)} · ${esc(d.review.time)}`:'not reviewed'}</div>
+     <div class="num" style="margin-top:6px"><kbd>j</kbd>/<kbd>k</kbd> next/prev · <kbd>r</kbd> random · <kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> review and next</div></div>`;
+  document.querySelectorAll('.rv button').forEach(b=>{if(d.review&&d.review.verdict===b.dataset.v)b.classList.add('on');b.onclick=()=>review(b.dataset.v)});
+  document.querySelectorAll('.sp').forEach(el=>el.onclick=()=>{const c=$('#sc'+el.dataset.k);if(c){c.scrollIntoView({behavior:'smooth',block:'center'});c.classList.add('flash');setTimeout(()=>c.classList.remove('flash'),900)}});
+}
+async function review(v){
+  if(!CUR)return; const note=$('#note').value;
+  await j('/api/review',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:CUR.row.id,verdict:v,note})});
+  await progress(); if(POS<IDX.length-1){POS++;await show()}else{await show()}
+}
+$('#src').onchange=()=>{fillLabels();refresh()};['#lab','#flag','#rev'].forEach(s=>$(s).onchange=()=>refresh());
+$('#prev').onclick=()=>{if(POS>0){POS--;show()}};$('#next').onclick=()=>{if(POS<IDX.length-1){POS++;show()}};
+$('#rand').onclick=()=>{if(IDX.length){POS=Math.floor(Math.random()*IDX.length);show()}};
+document.addEventListener('keydown',e=>{if(/textarea|input|select/i.test(e.target.tagName))return;
+  if(e.key==='j')$('#next').click();else if(e.key==='k')$('#prev').click();else if(e.key==='r')$('#rand').click();
+  else if(e.key==='1')review('good');else if(e.key==='2')review('bad');else if(e.key==='3')review('unsure')});
+init();
+</script></body></html>

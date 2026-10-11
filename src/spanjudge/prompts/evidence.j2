@@ -1,0 +1,26 @@
+You are given a document, a question about it, and the correct answer. Mark the parts of the document that lead to that answer.
+
+{% for part in parts %}
+[{{ part.name }}]
+{{ part.text }}
+
+{% endfor %}
+[Question]
+{{ question }}
+
+Possible answers:
+{% for id, desc in labels.items() %}
+- {{ id }}: {{ desc }}
+{% endfor %}
+
+The correct answer is "{{ label }}".
+
+Mark the text in the document because of which the answer is "{{ label }}": the words, phrases or sentences a careful reader would point to when explaining this answer. Mark only text inside the document sections above ({{ parts | map(attribute="name") | join(", ") }}), never the question or the answers.
+- Take the smallest stretch that fully covers each piece of evidence: a single word, a phrase, a sentence or a few consecutive sentences.
+- Separate pieces of evidence get separate spans; spans do not overlap.
+- Mark every piece of evidence the answer depends on, and nothing that does not matter for it.
+
+Copy each span exactly from the document and wrap it in <quote></quote>, with 5-6 characters of the surrounding text on each side so it can be found. Example: in "He paid on Monday and left." the span "on Monday" is written "paid <quote>on Monday</quote> and l".
+
+Output ONLY this JSON:
+{"spans": [{"section": "<section name>", "text": "...<quote>...</quote>...", "reason": "<why this text leads to the answer>"}]}

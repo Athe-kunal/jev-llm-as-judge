@@ -1,0 +1,13 @@
+Below is a document and one piece of it.
+
+{% for part in parts %}
+[{{ part.name }}]
+{{ part.text }}
+
+{% endfor %}
+Piece (in the {{ section }} section): "{{ span }}"
+
+Paraphrase only this piece: say exactly the same thing in different words, keeping every fact, number, name, error and tone, so that it still fits the text around it. If it cannot be reworded (a name, a number, a single word), copy it unchanged.
+
+Output ONLY this JSON:
+{"rewrite": "<the reworded piece>"}
