@@ -8,6 +8,8 @@ Usage:
       --out data/synth/pilot.jsonl   (writes pilot_review.md next to it)
   PYTHONPATH=src .venv/bin/python -m spanjudge.synth generate \
       --out data/synth/spans.jsonl   (resumable; progress in <out>.log)
+  PYTHONPATH=src .venv/bin/python -m spanjudge.synth filter \
+      --out data/synth/spans.jsonl   (writes spans_filtered / spans_dropped)
 
 A row is a document (named parts, e.g. Prompt and Response), a question,
 its answers (id -> description) and the correct answer. Qwen3.6-27B gets
@@ -164,8 +166,16 @@ def citation_control() -> list[dict[str, Any]]:
 
 
 def aegis() -> list[dict[str, Any]]:
-    """Prompt + response -> is the response unsafe? (dataset label)."""
-    out = []
+    """Prompt + response -> is the response unsafe? (dataset label).
+
+    Aegis ids name the prompt; one prompt can have several responses (the
+    model's, labelled by the LLM jury, and templated refusals added by
+    NVIDIA's refusal augmentation), so a row's id adds a hash of its
+    response. Exact repeats of a prompt + response are kept once.
+    """
+    import hashlib
+
+    out, seen = [], set()
     for split in ("train", "validation", "test"):
         ds = hf.load_dataset(
             "nvidia/Aegis-AI-Content-Safety-Dataset-2.0", split=split
@@ -174,19 +184,93 @@ def aegis() -> list[dict[str, Any]]:
             response = (r["response"] or "").strip()
             if not response:
                 continue
-            out.append(
-                row(
-                    "aegis",
-                    r["id"],
-                    [
-                        ("Prompt", f"User: {r['prompt']}"),
-                        ("Response", response),
-                    ],
-                    "Is the response unsafe?",
-                    _UNSAFE,
-                    "yes" if r["response_label"] == "unsafe" else "no",
-                )
+            rid = (
+                f"{r['id']}-{hashlib.sha256(response.encode()).hexdigest()[:8]}"
             )
+            if rid in seen:
+                continue
+            seen.add(rid)
+            x = row(
+                "aegis",
+                rid,
+                [("Prompt", f"User: {r['prompt']}"), ("Response", response)],
+                "Is the response unsafe?",
+                _UNSAFE,
+                "yes" if r["response_label"] == "unsafe" else "no",
+            )
+            x["label_source"] = r["response_label_source"]
+            out.append(x)
+    return out
+
+
+def _nimble_parts(state: Any) -> list[tuple[str, str]]:
+    """Document sections for a Nimble state (text, statements or fields)."""
+    if isinstance(state, str):
+        return [("Document", state)]
+    if isinstance(state, list):
+        return [("Statements", _nimble_text(state))]
+    parts = []
+    for key, value in state.items():
+        if key == "questions":  # a nested schema, not document text
+            continue
+        if key == "state" and not isinstance(value, str):
+            parts += _nimble_parts(value)
+            continue
+        parts.append((key.replace("_", " ").title(), _nimble_text(value)))
+    return [(n, t) for n, t in parts if t.strip()]
+
+
+def _nimble_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(
+            (
+                f"{v['speaker']}: {v['text']}"
+                if isinstance(v, dict) and {"speaker", "text"} <= set(v)
+                else _nimble_text(v)
+            )
+            for v in value
+        )
+    return json.dumps(value, ensure_ascii=False)
+
+
+def nimble(split: str) -> list[dict[str, Any]]:
+    """Bespoke Labs' Nimble data (github.com/bespokelabsai/nimble, data/).
+
+    Every row gets spans. Choice: the criteria keys; noul: true/false;
+    score: the levels 0.. with their rubric text (target is the level).
+    """
+    out = []
+    with open(f"data/external/nimble/{split}.jsonl") as f:
+        for line in f:
+            r = json.loads(line)
+            q = r["input"]["questions"]["decision"]
+            criteria, target = q["criteria"], r["reference"]["target"]
+            if q["type"] == "score":
+                labels = {str(i): d for i, d in enumerate(criteria)}
+                gold = str(target)
+            elif q["type"] == "noul":
+                labels = {k.lower(): v for k, v in criteria.items()}
+                gold = str(target).lower()
+            else:
+                labels, gold = dict(criteria), target
+            x = row(
+                f"nimble_{split}",
+                r["id"],
+                _nimble_parts(r["input"]["state"]),
+                q["instructions"],
+                labels,
+                gold,
+            )
+            x.update(
+                needs_spans=True,
+                kind=q["type"],
+                domain=r["domain"],
+                family=r["family"],
+                variant=r["variant"],
+            )
+            out.append(x)
     return out
 
 
@@ -195,6 +279,12 @@ LOADERS = {
     "aegis": aegis,
     "customer_control": customer_control,
     "citation_control": citation_control,
+}
+# Not part of the default synthetic set: run with --sources.
+ALL_LOADERS = {
+    **LOADERS,
+    "nimble_train": lambda: nimble("train"),
+    "nimble_eval": lambda: nimble("eval"),
 }
 
 
@@ -311,20 +401,36 @@ async def propose(
 
 
 class Qwen:
-    """Round-robin client over the vLLM servers, with a call counter."""
+    """Client over the vLLM servers, with a call counter.
+
+    Each request goes to the server with the fewest of this client's
+    requests in flight, so a slower server (less free GPU memory) gets fewer.
+    """
 
     def __init__(self, concurrency: int):
-        self.clients = itertools.cycle(
-            [openai.AsyncOpenAI(base_url=u, api_key="none") for u in _SERVERS]
-        )
+        self.servers = [  # long timeout: 8 samples can queue for a while
+            openai.AsyncOpenAI(base_url=u, api_key="none", timeout=1800)
+            for u in _SERVERS
+        ]
+        self.clients = itertools.cycle(self.servers)  # pilot code
+        self.busy = [0] * len(self.servers)
         self.sem = asyncio.Semaphore(concurrency)
         self.calls = 0
+
+    async def create(self, **kwargs: Any) -> Any:
+        """One completions request to the least busy server."""
+        i = min(range(len(self.servers)), key=self.busy.__getitem__)
+        self.busy[i] += 1
+        try:
+            return await self.servers[i].completions.create(**kwargs)
+        finally:
+            self.busy[i] -= 1
 
     async def complete(self, user: str, **kwargs: Any) -> Any:
         """One completion of a user message (no thinking)."""
         async with self.sem:
             self.calls += 1
-            out = await next(self.clients).completions.create(
+            out = await self.create(
                 model="judge", prompt=llm.chat_prefix(user), **kwargs
             )
         return out.choices[0]
@@ -646,8 +752,12 @@ def segments(r: dict[str, Any], samples: list[list[dict]]) -> list[list]:
 
 async def sample(
     q: Qwen, r: dict[str, Any], n: int, temp: float
-) -> list[list[dict]]:
-    """Located span samples (n of them) for the gold answer, one request."""
+) -> tuple[list[list[dict]], list[dict]]:
+    """Located span samples (n of them) for the gold answer, one request.
+
+    Also returns each sample's raw response: its text, finish reason and
+    located spans (None where a quoted span could not be found).
+    """
     user = prompts.render(
         "evidence",
         parts=r["parts"],
@@ -657,7 +767,7 @@ async def sample(
     )
     async with q.sem:
         q.calls += 1
-        out = await next(q.clients).completions.create(
+        out = await q.create(
             model="judge",
             prompt=llm.chat_prefix(user),
             max_tokens=1500,
@@ -665,16 +775,22 @@ async def sample(
             n=n,
             extra_body={"structured_outputs": {"json": _schema(r)}},
         )
-    samples = []
+    samples, responses = [], []
     for choice in out.choices:
         try:
             spans = json.loads(choice.text)["spans"]
         except (ValueError, KeyError):  # cut off at max_tokens
             spans = []
-        samples.append(
-            disjoint([x for x in map(lambda s: locate(r, s), spans) if x])
+        located = [locate(r, s) for s in spans]
+        samples.append(disjoint([x for x in located if x]))
+        responses.append(
+            {
+                "text": choice.text,
+                "finish_reason": choice.finish_reason,
+                "located": located,
+            }
         )
-    return samples
+    return samples, responses
 
 
 async def generate_row(
@@ -685,10 +801,14 @@ async def generate_row(
     base = {k: r[k] for k in keep}
     if not r["needs_spans"]:
         return {**base, "spans": [], "method": "none", "segments": []}
-    samples = await sample(q, r, n, 0.7)
-    spans, method = snapped(r, vote(r, samples, need)), "vote"
+    samples, responses = await sample(q, r, n, 0.7)
+    spans, method, greedy_response = (
+        snapped(r, vote(r, samples, need)),
+        "vote",
+        None,
+    )
     if not spans:
-        (greedy,) = await sample(q, r, 1, 0.0)
+        (greedy,), (greedy_response,) = await sample(q, r, 1, 0.0)
         spans, method = snapped(r, greedy), "greedy_fallback"
     return {
         **base,
@@ -696,11 +816,20 @@ async def generate_row(
         "method": method,
         "n_samples": n,
         "segments": segments(r, samples),
+        "responses": responses,  # the n raw samples (temperature 0.7)
+        "greedy_response": greedy_response,  # temperature 0, if used
     }
 
 
-async def generate(out: str, seed: int, concurrency: int, n: int, need: int):
-    """Writes final spans for every row of every source; resumable."""
+async def generate(
+    out: str,
+    seed: int,
+    concurrency: int,
+    n: int,
+    need: int,
+    sources: list[str] | None = None,
+):
+    """Writes final spans for every row of the sources; resumable."""
     import pathlib
     import time
 
@@ -708,9 +837,8 @@ async def generate(out: str, seed: int, concurrency: int, n: int, need: int):
     if pathlib.Path(out).exists():
         with open(out) as f:
             done = {json.loads(line)["id"] for line in f if line.strip()}
-    rows = [
-        x for load in LOADERS.values() for x in load() if x["id"] not in done
-    ]
+    loaders = [ALL_LOADERS[name] for name in sources or LOADERS]
+    rows = [x for load in loaders for x in load() if x["id"] not in done]
     random.Random(seed).shuffle(rows)  # sources interleaved in the output
     q = Qwen(concurrency)
     log = open(out + ".log", "a")
@@ -745,6 +873,76 @@ async def generate(out: str, seed: int, concurrency: int, n: int, need: int):
                     flush=True,
                 )
     print("done", file=log, flush=True)
+
+
+# customer-control questions whose "no" means something is absent: there is
+# no text to point at, so those rows become no-span rows.
+_ABSENCE = (
+    "The user is explicitly asking for a refund or credit",
+    "The user describes specific steps to reproduce the issue",
+)
+
+
+def filter_reason(x: dict[str, Any]) -> str | None:
+    """Why a generated row is dropped, or None to keep it.
+
+    Chosen against Sonnet reviews of 116 rated and 28 low-agreement rows
+    (data/synth/final_review/): a stretch marked by at least 6 of 8 samples
+    dropped no good row, unlike a pairwise-IoU threshold, which mostly
+    removed good rows whose samples differed only at the span edges.
+    """
+    if x["method"] == "none":
+        return None
+    spans = x["spans"]
+    if not spans:
+        return "empty"
+    if x["method"] == "greedy_fallback":
+        size = sum(len(p["text"]) for p in x["parts"])
+        if sum(s["end"] - s["start"] for s in spans) / max(size, 1) > 0.5:
+            return "fallback_covers_most"
+    if not any(count >= 6 for *_, count in x["segments"]):
+        return "no_core_6_of_8"
+    if x["source"] == "aegis" and all(s["part"] == "Prompt" for s in spans):
+        return "prompt_only"
+    if x["source"] == "citation_control" and all(
+        len(s["text"].split()) <= 3 for s in spans
+    ):
+        return "bare_value"
+    return None
+
+
+def apply_filter(path: str) -> None:
+    """Writes <path>_filtered.jsonl and <path>_dropped.jsonl (with reasons)."""
+    import collections
+
+    stem = path.rsplit(".", 1)[0]
+    kept = dropped = 0
+    reasons: collections.Counter = collections.Counter()
+    with (
+        open(path) as f,
+        open(stem + "_filtered.jsonl", "w") as fk,
+        open(stem + "_dropped.jsonl", "w") as fd,
+    ):
+        for line in f:
+            x = json.loads(line)
+            if (
+                x["source"] == "customer_control"
+                and x["label"] == "no"
+                and x["question"].startswith(_ABSENCE)
+            ):
+                x = {**x, "spans": [], "method": "none", "absence": True}
+                reasons["absence_to_no_span"] += 1
+            why = filter_reason(x)
+            if why:
+                reasons[why] += 1
+                dropped += 1
+                fd.write(
+                    json.dumps({**x, "dropped": why}, ensure_ascii=False) + "\n"
+                )
+            else:
+                kept += 1
+                fk.write(json.dumps(x, ensure_ascii=False) + "\n")
+    print(f"kept {kept}, dropped {dropped}; {dict(reasons)}")
 
 
 def review(path: str) -> str:
@@ -843,7 +1041,7 @@ def main() -> None:
     """CLI."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
-        "stage", choices=["preview", "pilot", "review", "generate"]
+        "stage", choices=["preview", "pilot", "review", "generate", "filter"]
     )
     parser.add_argument("--out", default="data/synth/pilot.jsonl")
     parser.add_argument("--tau", type=float, default=0.05)
@@ -852,15 +1050,25 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, default=480)
     parser.add_argument("--samples", type=int, default=8)
     parser.add_argument("--need", type=int, default=5, help="votes to keep")
+    parser.add_argument(
+        "--sources", nargs="*", help="generate: loaders to run (default: all)"
+    )
     args = parser.parse_args()
     if args.stage == "preview":
         asyncio.run(preview(args.n, args.seed, args.concurrency))
     elif args.stage == "review":
         print(review(args.out))
+    elif args.stage == "filter":
+        apply_filter(args.out)
     elif args.stage == "generate":
         asyncio.run(
             generate(
-                args.out, args.seed, args.concurrency, args.samples, args.need
+                args.out,
+                args.seed,
+                args.concurrency,
+                args.samples,
+                args.need,
+                args.sources,
             )
         )
     else:

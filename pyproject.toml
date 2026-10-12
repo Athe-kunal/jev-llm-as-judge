@@ -1,25 +1,23 @@
 [project]
 name = "spanjudge"
 version = "0.1.0"
-description = "Span-highlighting judge: data generation pipeline"
+description = "Span-highlighting judge: synthetic span data and a joint label + span model"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2",
     "openai>=1.50",
-    "pyyaml",
     "datasets",
     "fastapi",
     "uvicorn",
     "nvitop>=1.7.1",
     "torch==2.9.0",
     "torchvision==0.24.0",
-    "gliner2[train,disentangled-flash]>=2.1",
-    # Open-Jev's pinned training stack (its requirements.txt).
-    "open-jev",
-    "transformers==5.10.2",
-    "peft==0.19.1",
-    "accelerate==1.13.0",
+    # Nimble's training stack (third_party/nimble/requirements/training.txt).
+    "transformers==5.17.0",
+    "peft==0.21.0",
+    "accelerate==1.15.0",
+    "tensorboard",
     "flash-linear-attention==0.5.2",  # fast Gated DeltaNet for Qwen3.5
 ]
 
@@ -33,8 +31,6 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
-# A git checkout: Open-Jev's trainer records the source commit of each run.
-open-jev = { path = "../third_party/Open-Jev", editable = true }
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
 

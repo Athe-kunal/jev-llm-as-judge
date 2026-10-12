@@ -1,4 +1,4 @@
-You are given a document, a question about it, and the correct answer. Mark the parts of the document that lead to that answer.
+You are given a document, a question about it, and the correct answer. Your job is to mark the evidence: the text in the document that makes the correct answer right.
 
 {% for part in parts %}
 [{{ part.name }}]
@@ -15,7 +15,22 @@ Possible answers:
 
 The correct answer is "{{ label }}".
 
-Mark the text in the document because of which the answer is "{{ label }}": the words, phrases or sentences a careful reader would point to when explaining this answer. Mark only text inside the document sections above ({{ parts | map(attribute="name") | join(", ") }}), never the question or the answers.
+What counts as evidence
+Evidence is the text you would quote to convince a careful reader who doubts the answer "{{ label }}". It is what the answer rests on, not everything that is on topic. What that is depends on the question:
+- Whether a claim or statement holds: the text that states the same thing, or that conflicts with it.
+- Whether something has a problem (an error, a false or unsupported statement, harmful content, a wrong step, a bad translation): the problematic text itself, such as the false sentence, the wrong step or the mistranslated words, not the correct text around it. When the answer is that there is no problem, mark the text that shows this, if any does (for example a refusal of a harmful request).
+- A category, a decision or a route: the facts that meet the chosen answer's criteria and, where it matters, the facts that rule out the closest other answers.
+- A score or level on a scale: the facts that put the case at this level rather than the levels next to it.
+
+How to find it
+Before marking anything, work out why the answer is "{{ label }}": which conditions it depends on (from the question, the answer descriptions, or a rule or criterion stated in the document), and which text in the document settles each one.
+- Prefer specific facts to general statements. A condition is usually settled by concrete details (who, what, when, how much, which status, what was said) rather than by a summary or a general rule, when the document gives those details.
+- Follow references. If the deciding text refers to something indirectly (a name, a pronoun, an identifier, "the report", "that step"), the text that ties it to the case at hand is evidence too, when the answer would not follow without it.
+- When the document states a rule, policy, definition or criterion that the answer applies, mark it together with the facts it is applied to.
+- Test each candidate: if this text said something different, could the answer change? Mark it only if yes. Background, repeated information and text that is merely related to the topic are not evidence.
+
+How to mark it
+Mark only text inside the document sections above ({{ parts | map(attribute="name") | join(", ") }}), never the question or the answers.
 - Take the smallest stretch that fully covers each piece of evidence: a single word, a phrase, a sentence or a few consecutive sentences.
 - Separate pieces of evidence get separate spans; spans do not overlap.
 - Mark every piece of evidence the answer depends on, and nothing that does not matter for it.
