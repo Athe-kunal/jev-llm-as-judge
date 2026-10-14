@@ -364,6 +364,55 @@ input.
   encoding and token-level interaction, but with learned, multi-step
   attention), plus training the final answer toward the detached draft.
 
+### 5.6 A stronger reader for the strict final answer
+
+The question's tokens (encoded without the document) are the queries; each
+of 2 reader layers reads the cached document states with evidence-biased
+attention, lets the question tokens attend to each other, and applies a
+feed-forward step (a small decoder over cached features, like a
+question-driven BLIP-2 / InstructBLIP Q-Former without learned queries; like
+ColBERT it encodes question and document separately and interacts token by
+token, but with learned, multi-step attention). The reader starts from
+random weights at width 512 and reads final-layer document states. Training
+adds KL(draft, detached || final), so the draft teaches the final answer;
+at test time the final answer still sees the document only through the
+reader.
+
+| quick eval | single read: final / draft | stronger reader: final / draft | stronger reader + SelfCite: final / draft |
+|---|---|---|---|
+| step 400 | 0.581 / 0.800 | 0.614 / 0.795 | 0.614 / 0.794 |
+| step 600 | 0.588 / 0.802 | 0.697 / 0.802 | 0.671 / 0.801 |
+| step 800 | 0.605 / 0.804 | **0.737** / 0.800 | (pending) |
+
+The gap between the strict final answer and the draft shrank from ~0.20 to
+~0.06 and was still closing; span F1 is similar across runs (0.36-0.41), so
+the gain comes from the reader actually using the document.
+
+Full eval (18,842 rows) of the single-read version, for comparison with the
+question-first pair (5.2):
+
+| run | accuracy (mean) | macro F1 (mean) | sufficiency, own (random), lower better | comprehensiveness, own (random), higher better |
+|---|---|---|---|---|
+| question first, plain | 0.797 | 0.746 | 0.164 (0.368) | 0.318 (0.121) |
+| question first, consistency | 0.798 | 0.746 | 0.120 (0.257) | 0.290 (0.104) |
+| question at the end, single-read final answer | 0.605 | 0.514 | 0.104 (0.152) | 0.072 (0.045) |
+
+Removing the single-read head's highlights barely changes its answer
+(comprehensiveness 0.072, close to random 0.045), consistent with a reader
+that ignores the document. Pending: full eval of the stronger reader (with
+and without SelfCite) and the zeroed-document diagnostic on it.
+
+Possible next step: initialise the reader from Qwen3.5-2B's own
+full-attention layers. The model is a hybrid: of 24 layers only 3, 7, 11, 15,
+19 and 23 use full attention (8 query heads, 2 key/value heads, head size
+256, output gate, rotary positions on 25% of each head); the rest are linear
+attention (Gated DeltaNet), which keeps a running state and cannot attend to
+another sequence. Copies of layers 11, 15 and 19 (middle-upper, where models
+look up earlier context) would read layer-matched document states
+(`hidden_states[L]`, the input to layer L) with question queries at the same
+depth, shifted to positions after the document; ~45-50M parameters each,
+fine-tuned.
+
 ## 6. Candidate human-span datasets (not yet vetted)
 
 FaithBench (LLM summaries, expert spans with reasons), REVEAL (reasoning
@@ -381,4 +430,6 @@ annotate whole sentences.
 3. More weight on error-finding datasets in the small mix.
 4. MQM 1-5: keep or drop.
 5. Does SelfCite raise faithfulness (full eval pending)?
-6. Does the stronger reader close the final-vs-draft gap?
+6. Does the stronger reader also make answers depend on the evidence
+   (comprehensiveness well above random)?
+7. A reader initialised from Qwen's full-attention layers 11, 15, 19.
