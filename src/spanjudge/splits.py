@@ -3,6 +3,9 @@
 Usage:
   PYTHONPATH=src .venv/bin/python -m spanjudge.splits --seed 13 \
       --out data/splits
+  # a small label-balanced training set from the full split (see small()):
+  PYTHONPATH=src .venv/bin/python -m spanjudge.splits --small \
+      --out data/splits/small
 
 Every random choice uses --seed, so the same inputs give the same files.
 
@@ -220,14 +223,123 @@ def build(seed: int, max_tokens: int, out: pathlib.Path) -> None:
     print(f"groups in both train and eval: {len(leak)}")
 
 
+SMALL_PER_HUMAN, SMALL_PER_SYNTH, SMALL_NIMBLE_PAIRS = 600, 750, 500
+SPAN_LABEL_WEIGHT = 1.5  # labels whose rows mostly have spans get more rows
+NIMBLE = {"train": "data/synth/nimble-train.jsonl",
+          "eval": "data/synth/nimble-eval.jsonl"}
+
+
+def label_balanced(rows: list[dict], n: int, rng: random.Random) -> list[dict]:
+    """n rows, labels equally likely except span-bearing labels weighted up.
+
+    A label counts as span-bearing when most of its rows have spans; its
+    share is SPAN_LABEL_WEIGHT times the others'. Labels with too few rows
+    give their remainder to the rest.
+    """
+    by: dict[str, list] = collections.defaultdict(list)
+    for r in rows:
+        by[r["label"]].append(r)
+    weight = {
+        k: SPAN_LABEL_WEIGHT if sum(bool(r["spans"]) for r in v) > len(v) / 2
+        else 1.0
+        for k, v in by.items()
+    }
+    want: dict[str, int] = {}
+    left, open_ = n, set(by)
+    while left > 0 and open_:
+        total = sum(weight[k] for k in open_)
+        share = {k: left * weight[k] / total for k in open_}
+        full = {k for k in open_ if len(by[k]) - want.get(k, 0) <= share[k]}
+        if not full:
+            for k in open_:
+                want[k] = want.get(k, 0) + int(share[k])
+            break
+        for k in full:
+            left -= len(by[k]) - want.get(k, 0)
+            want[k] = len(by[k])
+        open_ -= full
+    out = []
+    for k, v in by.items():
+        out += rng.sample(v, min(want.get(k, 0), len(v)))
+    return out
+
+
+def small(seed: int, full: pathlib.Path, out: pathlib.Path) -> None:
+    """A ~10K label-balanced training set and the eval set plus nimble-eval.
+
+    From the full train split: SMALL_PER_HUMAN rows per human dataset (MQM
+    split evenly between its 1-5 and major-error questions),
+    SMALL_PER_SYNTH per synthetic source, each label-balanced; plus
+    SMALL_NIMBLE_PAIRS whole base / counterfactual pairs of nimble-train.
+    Eval: the full eval split plus nimble-eval.
+    """
+    rng = random.Random(seed)
+    by: dict[str, list] = collections.defaultdict(list)
+    with open(full / "train.jsonl") as f:
+        for line in f:
+            r = json.loads(line)
+            by[r["source"]].append(r)
+    train: list[dict] = []
+    for name in sorted(by):
+        rows = by[name]
+        if name == "mqm":
+            for kind in ("score", "major_error"):
+                part = [r for r in rows if r["subset"].endswith(kind)]
+                train += label_balanced(part, SMALL_PER_HUMAN // 2, rng)
+        else:
+            n = SMALL_PER_SYNTH if rows[0].get("synthetic") else SMALL_PER_HUMAN
+            train += label_balanced(rows, n, rng)
+
+    def nimble(split: str) -> list[dict]:
+        with open(NIMBLE[split]) as f:
+            rows = [json.loads(line) for line in f]
+        keep = ("id", "source", "parts", "question", "labels", "label",
+                "spans", "segments")
+        return [{**{k: r[k] for k in keep}, "subset": "nimble",
+                 "synthetic": True} for r in rows]
+
+    families: dict[str, list] = collections.defaultdict(list)
+    for r in nimble("train"):
+        families[r["id"].rsplit("-", 1)[0]].append(r)
+    for fam in rng.sample(sorted(families), SMALL_NIMBLE_PAIRS):
+        train += families[fam]
+    rng.shuffle(train)
+    out.mkdir(parents=True, exist_ok=True)
+    with open(out / "train.jsonl", "w") as f:
+        for r in train:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    with open(full / "eval.jsonl") as f:
+        evals = [json.loads(line) for line in f]
+    evals += nimble("eval")
+    with open(out / "eval.jsonl", "w") as f:
+        for r in evals:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    manifest = {"seed": seed, "train": len(train), "eval": len(evals),
+                "datasets": {}}
+    for r in train:
+        d = manifest["datasets"].setdefault(
+            r["source"], {"rows": 0, "with_spans": 0, "labels": {}})
+        d["rows"] += 1
+        d["with_spans"] += bool(r["spans"])
+        d["labels"][r["label"]] = d["labels"].get(r["label"], 0) + 1
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=1))
+
+
 def main() -> None:
     """CLI."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument("--out", default="data/splits")
+    parser.add_argument(
+        "--small", action="store_true", help="build the small set (small())"
+    )
+    parser.add_argument("--full", default="data/splits", help="for --small")
     args = parser.parse_args()
-    build(args.seed, args.max_tokens, pathlib.Path(args.out))
+    if args.small:
+        small(args.seed, pathlib.Path(args.full), pathlib.Path(args.out))
+    else:
+        build(args.seed, args.max_tokens, pathlib.Path(args.out))
 
 
 if __name__ == "__main__":

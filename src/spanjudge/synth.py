@@ -751,12 +751,18 @@ def segments(r: dict[str, Any], samples: list[list[dict]]) -> list[list]:
 
 
 async def sample(
-    q: Qwen, r: dict[str, Any], n: int, temp: float
+    q: Qwen, r: dict[str, Any], n: int, temp: float, think: int = 0
 ) -> tuple[list[list[dict]], list[dict]]:
     """Located span samples (n of them) for the gold answer, one request.
 
     Also returns each sample's raw response: its text, finish reason and
     located spans (None where a quoted span could not be found).
+
+    With think > 0, each sample first reasons freely (up to `think` tokens,
+    at temperature temp, n samples in one request), then writes its JSON
+    under the grammar, continuing its own reasoning at temperature 0. The
+    servers run without a reasoning parser, so the two steps are separate
+    requests; prefix caching makes the second one cheap.
     """
     user = prompts.render(
         "evidence",
@@ -765,18 +771,47 @@ async def sample(
         labels=r["labels"],
         label=r["label"],
     )
-    async with q.sem:
-        q.calls += 1
-        out = await q.create(
-            model="judge",
-            prompt=llm.chat_prefix(user),
-            max_tokens=1500,
-            temperature=temp,
-            n=n,
-            extra_body={"structured_outputs": {"json": _schema(r)}},
-        )
+    if think:
+        head = llm.chat_prefix(user, think=True)
+        async with q.sem:
+            q.calls += 1
+            thought = await q.create(
+                model="judge",
+                prompt=head,
+                max_tokens=think,
+                temperature=temp,
+                n=n,
+                stop=["</think>"],
+            )
+
+        async def answer(c: Any) -> Any:
+            async with q.sem:
+                q.calls += 1
+                out = await q.create(
+                    model="judge",
+                    prompt=head + c.text.rstrip() + "\n</think>\n\n",
+                    max_tokens=1500,
+                    temperature=0.0,
+                    extra_body={"structured_outputs": {"json": _schema(r)}},
+                )
+            return out.choices[0]
+
+        choices = await asyncio.gather(*map(answer, thought.choices))
+        thinking = [(c.text, c.finish_reason) for c in thought.choices]
+    else:
+        async with q.sem:
+            q.calls += 1
+            out = await q.create(
+                model="judge",
+                prompt=llm.chat_prefix(user),
+                max_tokens=1500,
+                temperature=temp,
+                n=n,
+                extra_body={"structured_outputs": {"json": _schema(r)}},
+            )
+        choices, thinking = out.choices, [None] * n
     samples, responses = [], []
-    for choice in out.choices:
+    for choice, thought_ in zip(choices, thinking, strict=True):
         try:
             spans = json.loads(choice.text)["spans"]
         except (ValueError, KeyError):  # cut off at max_tokens
@@ -788,27 +823,32 @@ async def sample(
                 "text": choice.text,
                 "finish_reason": choice.finish_reason,
                 "located": located,
+                **(
+                    {"thinking": thought_[0], "thinking_finish": thought_[1]}
+                    if thought_
+                    else {}
+                ),
             }
         )
     return samples, responses
 
 
 async def generate_row(
-    q: Qwen, r: dict[str, Any], n: int, need: int
+    q: Qwen, r: dict[str, Any], n: int, need: int, think: int = 0
 ) -> dict[str, Any]:
     """Final spans for one row (empty when the answer needs none)."""
     keep = ("id", "source", "parts", "question", "labels", "label")
     base = {k: r[k] for k in keep}
     if not r["needs_spans"]:
         return {**base, "spans": [], "method": "none", "segments": []}
-    samples, responses = await sample(q, r, n, 0.7)
+    samples, responses = await sample(q, r, n, 0.7, think)
     spans, method, greedy_response = (
         snapped(r, vote(r, samples, need)),
         "vote",
         None,
     )
     if not spans:
-        (greedy,), (greedy_response,) = await sample(q, r, 1, 0.0)
+        (greedy,), (greedy_response,) = await sample(q, r, 1, 0.0, think)
         spans, method = snapped(r, greedy), "greedy_fallback"
     return {
         **base,
@@ -828,6 +868,7 @@ async def generate(
     n: int,
     need: int,
     sources: list[str] | None = None,
+    think: int = 0,
 ):
     """Writes final spans for every row of the sources; resumable."""
     import pathlib
@@ -848,7 +889,7 @@ async def generate(
     async def one(r: dict[str, Any]) -> dict[str, Any] | None:
         for attempt in range(3):
             try:
-                return await generate_row(q, r, n, need)
+                return await generate_row(q, r, n, need, think)
             except openai.APIError as e:  # retry transient server errors
                 print(
                     f"retry {attempt + 1} {r['id']}: {e}", file=log, flush=True
@@ -1053,6 +1094,12 @@ def main() -> None:
     parser.add_argument(
         "--sources", nargs="*", help="generate: loaders to run (default: all)"
     )
+    parser.add_argument(
+        "--think",
+        type=int,
+        default=0,
+        help="generate: reasoning tokens per sample before the spans (0: none)",
+    )
     args = parser.parse_args()
     if args.stage == "preview":
         asyncio.run(preview(args.n, args.seed, args.concurrency))
@@ -1069,6 +1116,7 @@ def main() -> None:
                 args.samples,
                 args.need,
                 args.sources,
+                args.think,
             )
         )
     else:

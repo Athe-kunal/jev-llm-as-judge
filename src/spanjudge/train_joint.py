@@ -29,6 +29,16 @@ Evaluation every --eval-every steps on --eval-subset rows per dataset, and
 on the whole eval set at the end of each epoch; TensorBoard logs under
 <out>/tb; LoRA adapter + span head saved with each evaluation.
 
+Consistency (--consistency): on rows whose gold has spans, once
+--consistency-start of training has passed, the document tokens the span
+head selects (p >= 0.5) are used for two more forward passes (ERASER's
+faithfulness tests as losses): sufficiency, cross-entropy of the gold
+answer from the prompt with only the selected document tokens; and
+comprehensiveness, a hinge that wants p(gold) with the selected tokens
+removed at least --comp-margin below p(gold) on the full prompt (detached).
+The selection is hard, so these losses train the answer path, not the span
+head (so highlighting everything is never rewarded).
+
 Stability (after the first full run diverged at peak LR): lower default
 learning rates, steps whose gradient norm is non-finite or above
 --skip-grad-norm are skipped (no optimizer update), per-group gradient norms
@@ -67,6 +77,20 @@ _TAIL = (
 
 
 ORDER = "doc_first"  # or "question_first"; set from --order
+HEAD = "cross"  # or "evidence" (EvidenceHead, doc_first only); from --head
+
+
+def question_block(
+    row: dict[str, Any], order: list[str]
+) -> tuple[str, list[tuple[int, int]]]:
+    """The question and lettered choices, and each choice line's range."""
+    text = f"Question: {row['question']}\nChoices:\n"
+    ranges = []
+    for code, label in zip(string.ascii_uppercase, order, strict=False):
+        line = f"{code}. {row['labels'][label]}\n"
+        ranges.append((len(text), len(text) + len(line) - 1))
+        text += line
+    return text, ranges
 
 
 def build_prompt(
@@ -79,10 +103,7 @@ def build_prompt(
     question and choices, then the context, so the context's hidden states
     already depend on the question.
     """
-    question = f"Question: {row['question']}\nChoices:\n" + "".join(
-        f"{code}. {row['labels'][label]}\n"
-        for code, label in zip(string.ascii_uppercase, order, strict=False)
-    )
+    question, _ = question_block(row, order)
     text, where = _HEAD, {}
     if ORDER == "question_first":
         q_range = (len(text), len(text) + len(question))
@@ -144,7 +165,7 @@ def encode(row: dict[str, Any], tokenizer: Any, rng: random.Random | None):
         doc.append(inside)
         target.append(t)
         question.append(q_start <= a < q_end)
-    return {
+    ex = {
         "input_ids": enc["input_ids"],
         "gold": order.index(row["label"]),
         "n_choices": len(order),
@@ -152,6 +173,39 @@ def encode(row: dict[str, Any], tokenizer: Any, rng: random.Random | None):
         "target": target,
         "question": question,
     }
+    if HEAD == "evidence":
+        # The question and choices without the document (strict final answer)
+        block, ranges = question_block(row, order)
+        start = len(_HEAD)
+        iso = tokenizer(_HEAD + block + _TAIL, add_special_tokens=False,
+                        return_offsets_mapping=True)
+        offs = iso["offset_mapping"]
+        ex["iso_ids"] = iso["input_ids"]
+        ex["iso_q"] = [start <= a < start + len(block) for a, _ in offs]
+        ex["iso_choices"] = [
+            [k for k, (a, b) in enumerate(offs)
+             if b > a and start + s <= a and b <= start + e]
+            for s, e in ranges
+        ]
+    return ex
+
+
+def subset(ex: dict, keep: list[bool]) -> dict:
+    """The encoded row with only the document tokens where keep is True."""
+    out = {k: v for k, v in ex.items()}
+    ids, doc, target, question, k = [], [], [], [], 0
+    for tok, d, t, q in zip(ex["input_ids"], ex["doc"], ex["target"],
+                            ex["question"], strict=True):
+        if d:
+            k += 1
+            if not keep[k - 1]:
+                continue
+        ids.append(tok)
+        doc.append(d)
+        target.append(t)
+        question.append(q)
+    out.update(input_ids=ids, doc=doc, target=target, question=question)
+    return out
 
 
 class SpanHead(nn.Module):
@@ -177,10 +231,129 @@ class SpanHead(nn.Module):
         return self.out(self.norm(d + ctx)).squeeze(0).squeeze(-1)
 
 
+class _Attn(nn.Module):
+    """Multi-head attention through scaled_dot_product_attention."""
+
+    def __init__(self, dim: int, heads: int):
+        super().__init__()
+        self.h = heads
+        self.q, self.k, self.v, self.o = (nn.Linear(dim, dim) for _ in range(4))
+
+    def forward(self, x, mem, bias=None):
+        n, m, d = x.shape[0], mem.shape[0], x.shape[1]
+        split = lambda t, L: t.view(L, self.h, d // self.h).transpose(0, 1)
+        q, k, v = split(self.q(x), n), split(self.k(mem), m), split(self.v(mem), m)
+        mask = None if bias is None else bias.view(1, 1, m).expand(self.h, n, m)
+        y = nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        return self.o(y.transpose(0, 1).reshape(n, d))
+
+
+class EvidenceHead(nn.Module):
+    """Draft answer -> evidence spans -> final answer from the evidence.
+
+    Document states come from a document-first prompt, so they do not depend
+    on the question. Each layer: document tokens attend to the question-side
+    states (question, choices, and the draft answer as the choices' mix
+    weighted by the LM's draft probabilities), then to each other. The final
+    answer is strict: its query is the question encoded without the
+    document, and it reads the raw document states only through attention
+    biased by log p(evidence); choices are scored against their
+    document-free encodings. The gold answer is never an input.
+
+    Reader: with reader_layers = 0, one read by the mean question vector;
+    otherwise the question's tokens are the queries, and each reader layer
+    reads the document (evidence-biased) and lets the question tokens attend
+    to each other, a small decoder over the cached document states.
+    """
+
+    def __init__(self, hidden: int, dim: int = 512, heads: int = 8,
+                 layers: int = 2, reader_layers: int = 0):
+        super().__init__()
+        self.doc, self.mem, self.iso, self.raw = (
+            nn.Linear(hidden, dim) for _ in range(4))
+        self.blocks = nn.ModuleList(
+            nn.ModuleDict({
+                "n1": nn.LayerNorm(dim), "cross": _Attn(dim, heads),
+                "n2": nn.LayerNorm(dim), "self": _Attn(dim, heads),
+                "n3": nn.LayerNorm(dim),
+                "ff": nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(),
+                                    nn.Linear(4 * dim, dim)),
+            }) for _ in range(layers))
+        self.span = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim),
+                                  nn.GELU(), nn.Linear(dim, 1))
+        self.read = _Attn(dim, heads)
+        self.reader = nn.ModuleList(
+            nn.ModuleDict({
+                "n1": nn.LayerNorm(dim), "cross": _Attn(dim, heads),
+                "n2": nn.LayerNorm(dim), "self": _Attn(dim, heads),
+                "n3": nn.LayerNorm(dim),
+                "ff": nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(),
+                                    nn.Linear(4 * dim, dim)),
+            }) for _ in range(reader_layers))
+        self.final = nn.Sequential(nn.Linear(2 * dim, dim), nn.GELU(),
+                                   nn.Linear(dim, dim))
+
+    def forward(self, h_doc, h_q, i_q, i_choices, draft_p):
+        """Span logits (n_doc,) and final answer logits (n_choices,)."""
+        c = self.iso(i_choices)  # (k, dim)
+        mem = torch.cat([self.mem(h_q), (draft_p.unsqueeze(1) * c).sum(0, True)])
+        x = self.doc(h_doc)
+        for b in self.blocks:
+            x = x + b["cross"](b["n1"](x), mem)
+            y = b["n2"](x)
+            x = x + b["self"](y, y)
+            x = x + b["ff"](b["n3"](x))
+        span = self.span(x).squeeze(-1)
+        q_tok = self.iso(i_q)
+        query = q_tok.mean(0, keepdim=True)
+        bias = nn.functional.logsigmoid(span)  # log p(evidence)
+        doc = self.raw(h_doc)
+        if self.reader:
+            x_q = q_tok
+            for b in self.reader:
+                x_q = x_q + b["cross"](b["n1"](x_q), doc, bias)
+                y = b["n2"](x_q)
+                x_q = x_q + b["self"](y, y)
+                x_q = x_q + b["ff"](b["n3"](x_q))
+            read = x_q.mean(0, keepdim=True)
+        else:
+            read = self.read(query, doc, bias)
+        z = self.final(torch.cat([read, query], -1))  # (1, dim)
+        return span, (z @ c.T).squeeze(0) / c.shape[-1] ** 0.5
+
+
+def _hidden(model, ids, device, ckpt_tokens, logits=True):
+    if len(ids) > ckpt_tokens:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+    elif model.training:
+        model.gradient_checkpointing_disable()
+    return model(input_ids=torch.tensor([ids], device=device),
+                 output_hidden_states=True, logits_to_keep=1, use_cache=False)
+
+
 def forward(
     model, head, ex: dict, codes: list[int], device: str, ckpt_tokens: int
 ):
-    """Code logits and span logits for one encoded row."""
+    """Answer logits, span logits, and the draft (LM letter) logits.
+
+    With the cross head the answer is the LM letter and the draft is None.
+    With the evidence head the answer is the head's final answer.
+    """
+    if HEAD == "evidence":
+        out = _hidden(model, ex["input_ids"], device, ckpt_tokens)
+        draft = out.logits[0, -1].float()[codes[: ex["n_choices"]]]
+        hidden = out.hidden_states[-1][0].float()
+        iso = _hidden(model, ex["iso_ids"], device, ckpt_tokens)
+        ih = iso.hidden_states[-1][0].float()
+        doc = torch.tensor(ex["doc"], device=device)
+        question = torch.tensor(ex["question"], device=device)
+        i_q = ih[torch.tensor(ex["iso_q"], device=device)]
+        i_c = torch.stack([ih[idx].mean(0) for idx in ex["iso_choices"]])
+        span, final = head(hidden[doc], hidden[question], i_q, i_c,
+                           torch.softmax(draft, -1))
+        return final, span, draft
     if len(ex["input_ids"]) > ckpt_tokens:
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -199,7 +372,75 @@ def forward(
     doc = torch.tensor(ex["doc"], device=device)
     question = torch.tensor(ex["question"], device=device)
     span = head(hidden[doc], hidden[question])
-    return logits, span
+    return logits, span, None
+
+
+def code_logits(model, ids: list[int], codes: list[int], n: int,
+                device: str, ckpt_tokens: int) -> torch.Tensor:
+    """Answer-code logits for a token sequence (no span head)."""
+    if len(ids) > ckpt_tokens:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+    elif model.training:
+        model.gradient_checkpointing_disable()
+    out = model(input_ids=torch.tensor([ids], device=device),
+                logits_to_keep=1, use_cache=False)
+    return out.logits[0, -1].float()[codes[:n]]
+
+
+def reduced(ex: dict, span: torch.Tensor) -> tuple[list, list, int]:
+    """Prompt ids with only / without the selected document tokens."""
+    chosen = (torch.sigmoid(span.detach()) >= 0.5).cpu().tolist()
+    keep_only, drop, k = [], [], 0
+    for tok, is_doc in zip(ex["input_ids"], ex["doc"], strict=True):
+        if not is_doc:
+            keep_only.append(tok)
+            drop.append(tok)
+            continue
+        (keep_only if chosen[k] else drop).append(tok)
+        k += 1
+    return keep_only, drop, sum(chosen)
+
+
+def selfcite(model, ex: dict, span: torch.Tensor, draft: torch.Tensor,
+             codes: list[int], device: str, ckpt_tokens: int,
+             k: int = 3, cap: float = 0.5):
+    """SelfCite-style relative reward for sampled evidence sets.
+
+    Candidates: the tokens with p >= 0.5 and k - 1 sets sampled token by
+    token from p. Reward (Chuang et al. 2025): log p(y | only the set) -
+    log p(y | without the set), y the model's own draft answer, on the LM
+    letter, without gradient. Sets marking nothing or more than `cap` of the
+    document are left out. Returns the policy-gradient loss on the span head
+    (advantage = reward minus the candidates' mean; log-likelihood per
+    token) and the mean reward, or None with fewer than two candidates.
+    """
+    p = torch.sigmoid(span).clamp(0.02, 0.98)
+    sets = [(p.detach() >= 0.5)] + [
+        torch.bernoulli(p.detach()).bool() for _ in range(k - 1)]
+    n = p.shape[0]
+    sets = [e for e in sets if 0 < int(e.sum()) <= cap * n]
+    if len(sets) < 2:
+        return None
+    y = int(draft.argmax())
+    rewards = []
+    with torch.no_grad():
+        for e in sets:
+            keep = e.cpu().tolist()
+            lp = []
+            for kept in (keep, [not x for x in keep]):
+                ids = subset(ex, kept)["input_ids"]
+                lg = code_logits(model, ids, codes, ex["n_choices"], device,
+                                 ckpt_tokens)
+                lp.append(torch.log_softmax(lg, -1)[y])
+            rewards.append(lp[0] - lp[1])
+    r = torch.stack(rewards)
+    adv = r - r.mean()
+    logp = torch.stack([
+        (e.float() * p.log() + (~e).float() * (1 - p).log()).mean()
+        for e in sets])
+    return -(adv * logp).mean(), r.mean().item()
 
 
 def losses(
@@ -241,7 +482,7 @@ def evaluate(model, head, rows, tok, codes, device, ckpt, rank, world) -> dict:
     with torch.no_grad():
         for row in rows[rank::world]:
             ex = encode(row, tok, None)
-            logits, span = forward(model, head, ex, codes, device, 10**9)
+            logits, span, draft = forward(model, head, ex, codes, device, 10**9)
             label_loss, span_loss = losses(logits, span, ex, device)
             pred = (torch.sigmoid(span) > 0.5).cpu().tolist()
             gold = [
@@ -253,13 +494,16 @@ def evaluate(model, head, rows, tok, codes, device, ckpt, rank, world) -> dict:
                 s = stats[key]
                 s["n"] += 1
                 s["right"] += int(logits.argmax().item() == ex["gold"])
+                if draft is not None:
+                    s["draft_right"] += int(draft.argmax().item() == ex["gold"])
                 s["label_loss"] += label_loss.item()
                 s["span_loss"] += span_loss.item()
                 s["tp"] += sum(p and g for p, g in zip(pred, gold, strict=True))
                 s["pred"] += sum(pred)
                 s["gold"] += sum(gold)
     keys = sorted(stats)
-    names = ["n", "right", "label_loss", "span_loss", "tp", "pred", "gold"]
+    names = ["n", "right", "draft_right", "label_loss", "span_loss", "tp",
+             "pred", "gold"]
     local = torch.tensor([[float(stats[k][n]) for n in names] for k in keys])
     gathered = [None] * world
     dist.all_gather_object(gathered, (keys, local.tolist()))
@@ -276,6 +520,8 @@ def evaluate(model, head, rows, tok, codes, device, ckpt, rank, world) -> dict:
         r = s["tp"] / s["gold"] if s["gold"] else 0.0
         result[k] = {
             "accuracy": s["right"] / s["n"],
+            **({"draft_accuracy": s["draft_right"] / s["n"]}
+               if HEAD == "evidence" else {}),
             "label_loss": s["label_loss"] / s["n"],
             "span_loss": s["span_loss"] / s["n"],
             "span_precision": p,
@@ -342,9 +588,42 @@ def main() -> None:
         default="question_first",
     )
     parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument(
+        "--head", choices=["cross", "evidence"], default="cross",
+        help="evidence: draft -> spans -> strict final answer (doc_first)")
+    parser.add_argument("--head-layers", type=int, default=2)
+    parser.add_argument("--draft-weight", type=float, default=1.0)
+    parser.add_argument("--reader-layers", type=int, default=0,
+                        help="evidence head: question-token reader depth")
+    parser.add_argument(
+        "--distill-weight", type=float, default=0.0,
+        help="evidence head: KL(draft, detached || final), training only")
+    parser.add_argument("--selfcite", action="store_true",
+                        help="SelfCite-style reward on sampled evidence sets")
+    parser.add_argument("--selfcite-weight", type=float, default=1.0)
+    parser.add_argument("--selfcite-k", type=int, default=3)
+    parser.add_argument("--consistency", action="store_true")
+    parser.add_argument("--suff-weight", type=float, default=0.5)
+    parser.add_argument("--comp-weight", type=float, default=0.5)
+    parser.add_argument("--comp-margin", type=float, default=0.3)
+    parser.add_argument(
+        "--consistency-start",
+        type=float,
+        default=0.2,
+        help="share of training before the consistency losses start",
+    )
+    parser.add_argument(
+        "--no-epoch-eval",
+        action="store_true",
+        help="skip the full eval after each epoch (checkpoints still saved)",
+    )
     args = parser.parse_args()
-    global ORDER
-    ORDER = args.order
+    global ORDER, HEAD
+    ORDER, HEAD = args.order, args.head
+    if HEAD == "evidence" and ORDER != "doc_first":
+        raise ValueError("the evidence head needs --order doc_first")
+    if args.consistency and HEAD == "evidence":
+        raise ValueError("--consistency is for the cross head; use --selfcite")
 
     from peft import LoraConfig
     from peft import get_peft_model
@@ -411,7 +690,10 @@ def main() -> None:
     )
     model.enable_input_require_grads()
     hidden = model.config.get_text_config().hidden_size
-    head = SpanHead(hidden).to(device)
+    head = (EvidenceHead(hidden, layers=args.head_layers,
+                         reader_layers=args.reader_layers)
+            if HEAD == "evidence"
+            else SpanHead(hidden)).to(device)
     lora = [p for p in model.parameters() if p.requires_grad]
     params = lora + list(head.parameters())
     opt = torch.optim.AdamW(
@@ -487,20 +769,61 @@ def main() -> None:
             batch = order[b * args.batch_size : (b + 1) * args.batch_size]
             mine = batch[rank * micro : (rank + 1) * micro]
             opt.zero_grad(set_to_none=True)
-            sums = [0.0, 0.0, 0.0]
+            sums = [0.0] * 8
             for i in mine:
                 row = train[i]
                 ex = encode(row, tok, random.Random(f"{args.seed}:{epoch}:{i}"))
                 if len(ex["input_ids"]) > args.max_tokens:
                     continue
-                logits, span = forward(
+                logits, span, draft = forward(
                     model, head, ex, codes, device, args.ckpt_tokens
                 )
                 label_loss, span_loss = losses(logits, span, ex, device)
-                loss = (
-                    label_loss + args.span_weight * span_loss
-                ) / args.batch_size
-                loss.backward()
+                loss = label_loss + args.span_weight * span_loss
+                if draft is not None:
+                    draft_loss = nn.functional.cross_entropy(
+                        draft.unsqueeze(0),
+                        torch.tensor([ex["gold"]], device=device))
+                    loss = loss + args.draft_weight * draft_loss
+                    sums[7] += draft_loss.item()
+                    if args.distill_weight:
+                        teacher = torch.softmax(draft.detach(), -1)
+                        loss = loss + args.distill_weight * nn.functional.kl_div(
+                            torch.log_softmax(logits, -1), teacher,
+                            reduction="sum")
+                if (args.selfcite and row["spans"]
+                        and step >= args.consistency_start * total):
+                    sc = selfcite(model, ex, span, draft, codes, device,
+                                  args.ckpt_tokens, k=args.selfcite_k)
+                    if sc is not None:
+                        loss = loss + args.selfcite_weight * sc[0]
+                        sums[3] += sc[0].item()
+                        sums[4] += sc[1]
+                        sums[5] += 1
+                if (
+                    args.consistency
+                    and row["spans"]
+                    and step >= args.consistency_start * total
+                ):
+                    only, drop, n_sel = reduced(ex, span)
+                    if n_sel:
+                        n = ex["n_choices"]
+                        gold = torch.tensor([ex["gold"]], device=device)
+                        suff = nn.functional.cross_entropy(
+                            code_logits(model, only, codes, n, device,
+                                        args.ckpt_tokens).unsqueeze(0), gold)
+                        p_full = torch.softmax(logits, -1)[ex["gold"]].detach()
+                        p_drop = torch.softmax(
+                            code_logits(model, drop, codes, n, device,
+                                        args.ckpt_tokens), -1)[ex["gold"]]
+                        comp = torch.relu(p_drop - p_full + args.comp_margin)
+                        loss = (loss + args.suff_weight * suff
+                                + args.comp_weight * comp)
+                        sums[3] += suff.item()
+                        sums[4] += comp.item()
+                        sums[5] += 1
+                    sums[6] += n_sel / max(1, sum(ex["doc"]))
+                (loss / args.batch_size).backward()
                 sums[0] += label_loss.item()
                 sums[1] += span_loss.item()
                 sums[2] += len(ex["input_ids"])
@@ -544,6 +867,18 @@ def main() -> None:
                 writer.add_scalar(
                     "train/loss", lab + args.span_weight * spn, step
                 )
+                n_c = max(1.0, totals[5].item())
+                if args.consistency:
+                    writer.add_scalar("train/suff_loss", totals[3] / n_c, step)
+                    writer.add_scalar("train/comp_loss", totals[4] / n_c, step)
+                    writer.add_scalar("train/consistency_rows", totals[5], step)
+                if args.selfcite:
+                    writer.add_scalar("train/selfcite_loss", totals[3] / n_c, step)
+                    writer.add_scalar("train/selfcite_reward", totals[4] / n_c, step)
+                    writer.add_scalar("train/selfcite_rows", totals[5], step)
+                if HEAD == "evidence":
+                    writer.add_scalar("train/draft_loss",
+                                      totals[7] / args.batch_size, step)
                 writer.add_scalar("train/grad_norm", norm.item(), step)
                 writer.add_scalar("train/grad_norm_lora", lora_norm, step)
                 writer.add_scalar("train/grad_norm_head", head_norm, step)
@@ -561,6 +896,20 @@ def main() -> None:
                     f"{lora_norm:.3f} head {head_norm:.3f}) skipped {skipped} lr "
                     f"{sched.get_last_lr()[0]:.2e} elapsed {elapsed / 60:.1f}m"
                 )
+                if HEAD == "evidence":
+                    line += f" draft_loss {totals[7].item() / args.batch_size:.4f}"
+                if args.selfcite and totals[5] > 0:
+                    line += (
+                        f" selfcite {totals[3].item() / totals[5].item():.4f} "
+                        f"reward {totals[4].item() / totals[5].item():.3f} "
+                        f"({int(totals[5].item())} rows)"
+                    )
+                if args.consistency and totals[5] > 0:
+                    line += (
+                        f" suff {totals[3].item() / totals[5].item():.4f} comp "
+                        f"{totals[4].item() / totals[5].item():.4f} "
+                        f"({int(totals[5].item())} rows)"
+                    )
                 print(line, flush=True)
                 log.write(line + "\n")
                 log.flush()
@@ -582,19 +931,22 @@ def main() -> None:
                 break
         if 0 < args.stop_after_steps <= step:
             break
-        m = evaluate(
-            model,
-            head,
-            evals,
-            tok,
-            codes,
-            device,
-            args.ckpt_tokens,
-            rank,
-            world,
-        )
-        report(step, m, "eval_full")
-        save(f"epoch-{epoch + 1}", m)
+        if args.no_epoch_eval:
+            save(f"epoch-{epoch + 1}", None)
+        else:
+            m = evaluate(
+                model,
+                head,
+                evals,
+                tok,
+                codes,
+                device,
+                args.ckpt_tokens,
+                rank,
+                world,
+            )
+            report(step, m, "eval_full")
+            save(f"epoch-{epoch + 1}", m)
         if step >= total:
             break
     save("final", None)

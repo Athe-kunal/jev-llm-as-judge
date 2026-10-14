@@ -11,10 +11,12 @@ h1{font-size:16px;margin:0 10px 0 0}h2{font-size:12px;margin:0 0 6px;color:var(-
 select,button{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:3px 8px;cursor:pointer}
 button.primary{background:var(--ink);color:var(--panel)}
 .pill{font-size:12px;padding:2px 8px;border-radius:99px;border:1px solid var(--line);color:var(--ink2)}
-main{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:12px;padding:12px 16px;max-width:1400px;margin:0 auto}
+main{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:12px;padding:12px 16px;max-width:1900px;margin:0 auto}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:12px}
 @media(max-width:900px){main{grid-template-columns:1fr}}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;margin-bottom:12px}
 .doc{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.7;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:10px;max-height:62vh;overflow:auto}
+.f{border-bottom:3px solid var(--ok);padding-bottom:5px}
 .g{text-decoration:underline;text-decoration-color:var(--gold);text-decoration-thickness:3px;text-underline-offset:3px}
 .row{display:flex;align-items:center;gap:8px;margin:3px 0}.lab{flex:0 0 130px;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bar{height:9px;border-radius:2px;background:var(--mute)}.bar.p{background:rgb(var(--hl))}
@@ -32,24 +34,29 @@ main{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:12px;padding:12p
 <script>
 const $=s=>document.querySelector(s), esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let M=null,D=null;
-async function init(){M=await (await fetch('/api/meta')).json();$('#meta').textContent=`${M.checkpoint} · ${M.order} · ${M.rows} eval rows`;
+async function init(){M=await (await fetch('/api/meta')).json();$('#meta').textContent=`${M.checkpoint} · ${M.order} · ${M.rows} rows`;
  Object.keys(M.labels).sort().forEach(s=>$('#src').insertAdjacentHTML('beforeend',`<option>${esc(s)}</option>`));fill()}
 function fill(){const s=$('#src').value;const ls=s?M.labels[s]:[...new Set(Object.values(M.labels).flat())];
  $('#lab').innerHTML='<option value="">all gold answers</option>'+ls.map(l=>`<option value="${esc(l)}">${esc(l.length>40?l.slice(0,40)+'…':l)}</option>`).join('')}
 function render(){if(!D)return;if(D.error){$('#left').innerHTML=`<div class="card">${esc(D.error)}</div>`;return}
- const r=D.row,p=D.pred,thr=+$('#thr').value;let tp=0,pp=0,gg=0;
- const docs=r.parts.map(part=>{const toks=p.tokens[part.name]||[], gold=r.spans.filter(s=>s.part===part.name);
-  const inGold=(a,b)=>gold.some(s=>a<s.end&&b>s.start);let o='',pos=0;
-  for(const [a,b,pr] of toks){o+=esc(part.text.slice(pos,a));const g=inGold(a,b),on=pr>=thr;
-   tp+=g&&on;pp+=on;gg+=g;const alpha=on?(0.25+0.6*pr):(pr>0.15?0.12:0);
-   o+=`<span class="${g?'g':''}" style="${alpha?`background:rgba(var(--hl),${alpha.toFixed(2)})`:''}" title="p=${pr.toFixed(2)}">${esc(part.text.slice(a,b))}</span>`;pos=b}
-  o+=esc(part.text.slice(pos));return `<h2>${esc(part.name)}</h2><div class="doc">${o}</div>`}).join('<div style="height:10px"></div>');
- const P=pp?tp/pp:0,R=gg?tp/gg:0,F=P+R?2*P*R/(P+R):0;const right=p.label===r.label;
- $('#left').innerHTML=`<div class="card"><div class="num">${esc(r.id)} · ${esc(r.source)} · ${esc(r.subset||'')} · ${p.n_tokens} tokens · ${D.ms} ms</div><h2 style="margin-top:8px">Question</h2><div style="white-space:pre-wrap">${esc(r.question)}</div></div>
-  <div class="card"><div class="legend"><span><span class="g">blue underline</span> = gold evidence</span><span style="background:rgba(var(--hl),.6);border-radius:2px">orange</span> = model evidence (darker = more confident; faint = below threshold)</div>${docs}</div>`;
- $('#right').innerHTML=`<div class="card"><h2>Decision</h2><div class="big">model: <span class="${right?'ok':'bad'}">${esc(p.label)}</span></div><div>gold: <b>${esc(r.label)}</b> ${right?'<span class="ok">✓</span>':'<span class="bad">✗</span>'}</div>
-  <div style="margin-top:8px">${Object.entries(p.probs).map(([k,v])=>`<div class="row"><span class="lab" title="${esc(r.labels[k])}">${esc(k)}</span><div class="bar ${k===p.label?'p':''}" style="width:${v*150}px"></div><span class="num">${v.toFixed(2)}</span></div>`).join('')}</div></div>
-  <div class="card"><h2>Evidence (tokens, at threshold ${thr.toFixed(2)})</h2><div>gold tokens: <b>${gg}</b> · predicted: <b>${pp}</b></div><div class="num">${gg||pp?`precision ${P.toFixed(2)} · recall ${R.toFixed(2)} · <b>F1 ${F.toFixed(2)}</b>`:'no evidence on either side ✓'}</div></div>`}
+ const r=D.row,thr=+$('#thr').value;
+ const view=p=>{let tp=0,pp=0,gg=0;
+  const docs=r.parts.map(part=>{const toks=p.tokens[part.name]||[], gold=r.spans.filter(s=>s.part===part.name);
+   const inGold=(a,b)=>gold.some(s=>a<s.end&&b>s.start);const focus=(r.focus||[]).filter(s=>s.part===part.name);const inFocus=(a,b)=>focus.some(s=>a<s.end&&b>s.start);let o='',pos=0;
+   for(const [a,b,pr] of toks){o+=esc(part.text.slice(pos,a));const g=inGold(a,b),on=pr>=thr;
+    tp+=g&&on;pp+=on;gg+=g;const alpha=on?(0.25+0.6*pr):(pr>0.15?0.12:0);
+    o+=`<span class="${g?'g':''} ${inFocus(a,b)?'f':''}" style="${alpha?`background:rgba(var(--hl),${alpha.toFixed(2)})`:''}" title="p=${pr.toFixed(2)}">${esc(part.text.slice(a,b))}</span>`;pos=b}
+   o+=esc(part.text.slice(pos));return `<h2>${esc(part.name)}</h2><div class="doc">${o}</div>`}).join('<div style="height:10px"></div>');
+  const P=pp?tp/pp:0,R=gg?tp/gg:0,F=P+R?2*P*R/(P+R):0;const right=p.label===r.label;
+  const side=`<div class="card"><h2>${esc(p.name)}: decision</h2><div class="big"><span class="${right?'ok':'bad'}">${esc(p.label)}</span> ${right?'<span class="ok">✓</span>':'<span class="bad">✗</span>'}</div>
+   <div style="margin-top:8px">${Object.entries(p.probs).map(([k,v])=>`<div class="row"><span class="lab" title="${esc(r.labels[k])}">${esc(k)}</span><div class="bar ${k===p.label?'p':''}" style="width:${v*150}px"></div><span class="num">${v.toFixed(2)}</span></div>`).join('')}</div>
+   <h2 style="margin-top:10px">${esc(p.name)}: evidence at ${thr.toFixed(2)}</h2><div>gold tokens <b>${gg}</b> · marked <b>${pp}</b></div><div class="num">${gg||pp?`P ${P.toFixed(2)} · R ${R.toFixed(2)} · <b>F1 ${F.toFixed(2)}</b>`:'no evidence on either side ✓'}</div></div>`;
+  return {docs,side}};
+ const vs=D.preds.map(view);
+ const legend=`<div class="legend"><span><span class="g">blue underline</span> = gold evidence${r.focus?' (for Nimble: our Qwen 27B annotation, 5 of 8 votes)':''}</span>${r.focus?'<span><span class="f">green underline</span> = Nimble\'s verified focus evidence</span>':''}<span style="background:rgba(var(--hl),.6);border-radius:2px">orange</span> = model evidence (darker = more confident; faint = below threshold)</div>`;
+ $('#left').innerHTML=`<div class="card"><div class="num">${esc(r.id)} · ${esc(r.source)} · ${esc(r.subset||'')} · ${D.preds[0].n_tokens} tokens · ${D.ms} ms</div><h2 style="margin-top:8px">Question</h2><div style="white-space:pre-wrap">${esc(r.question)}</div><div style="margin-top:6px">gold answer: <b>${esc(r.label)}</b> <span class="num">${esc(r.labels[r.label]||'')}</span></div></div>
+  <div class="cols">${D.preds.map((p,i)=>`<div class="card"><h2 style="font-size:14px;color:var(--ink)">${esc(p.name)}</h2>${legend}${vs[i].docs}</div>`).join('')}</div>`;
+ $('#right').innerHTML=vs.map(v=>v.side).join('')}
 async function go(){$('#go').disabled=true;$('#go').textContent='Running…';
  try{D=await (await fetch('/api/sample?'+new URLSearchParams({source:$('#src').value,label:$('#lab').value,spans:$('#spn').value}))).json();render()}catch(e){$('#left').innerHTML='<div class="card bad">Server unreachable.</div>'}
  $('#go').disabled=false;$('#go').textContent='Random example'}
