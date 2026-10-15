@@ -48,8 +48,9 @@ function render(){if(!D)return;if(D.error){$('#left').innerHTML=`<div class="car
     o+=`<span class="${g?'g':''} ${inFocus(a,b)?'f':''}" style="${alpha?`background:rgba(var(--hl),${alpha.toFixed(2)})`:''}" title="p=${pr.toFixed(2)}">${esc(part.text.slice(a,b))}</span>`;pos=b}
    o+=esc(part.text.slice(pos));return `<h2>${esc(part.name)}</h2><div class="doc">${o}</div>`}).join('<div style="height:10px"></div>');
   const P=pp?tp/pp:0,R=gg?tp/gg:0,F=P+R?2*P*R/(P+R):0;const right=p.label===r.label;
-  const side=`<div class="card"><h2>${esc(p.name)}: decision</h2><div class="big"><span class="${right?'ok':'bad'}">${esc(p.label)}</span> ${right?'<span class="ok">✓</span>':'<span class="bad">✗</span>'}</div>
-   <div style="margin-top:8px">${Object.entries(p.probs).map(([k,v])=>`<div class="row"><span class="lab" title="${esc(r.labels[k])}">${esc(k)}</span><div class="bar ${k===p.label?'p':''}" style="width:${v*150}px"></div><span class="num">${v.toFixed(2)}</span></div>`).join('')}</div>
+  const rd=p.reader?`<div class="num" style="margin-top:6px">strict reader: <b class="${p.reader.label===r.label?'ok':'bad'}">${esc(p.reader.label)}</b> (${Math.max(...Object.values(p.reader.probs)).toFixed(2)})</div>`:'';
+  const side=`<div class="card"><h2>${esc(p.name)}: decision (LM letter)</h2><div class="big"><span class="${right?'ok':'bad'}">${esc(p.label)}</span> ${right?'<span class="ok">✓</span>':'<span class="bad">✗</span>'}</div>
+   ${rd}<div style="margin-top:8px">${Object.entries(p.probs).map(([k,v])=>`<div class="row"><span class="lab" title="${esc(r.labels[k])}">${esc(k)}</span><div class="bar ${k===p.label?'p':''}" style="width:${v*150}px"></div><span class="num">${v.toFixed(2)}</span></div>`).join('')}</div>
    <h2 style="margin-top:10px">${esc(p.name)}: evidence at ${thr.toFixed(2)}</h2><div>gold tokens <b>${gg}</b> · marked <b>${pp}</b></div><div class="num">${gg||pp?`P ${P.toFixed(2)} · R ${R.toFixed(2)} · <b>F1 ${F.toFixed(2)}</b>`:'no evidence on either side ✓'}</div></div>`;
   return {docs,side}};
  const vs=D.preds.map(view);

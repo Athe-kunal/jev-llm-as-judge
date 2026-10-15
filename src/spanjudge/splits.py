@@ -3,6 +3,9 @@
 Usage:
   PYTHONPATH=src .venv/bin/python -m spanjudge.splits --seed 13 \
       --out data/splits
+  # the full training set re-sampled label-balanced (see balanced_full()):
+  PYTHONPATH=src .venv/bin/python -m spanjudge.splits --balanced \
+      --out data/splits/balanced
   # a small label-balanced training set from the full split (see small()):
   PYTHONPATH=src .venv/bin/python -m spanjudge.splits --small \
       --out data/splits/small
@@ -325,6 +328,70 @@ def small(seed: int, full: pathlib.Path, out: pathlib.Path) -> None:
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1))
 
 
+def balanced_full(seed: int, max_tokens: int, full: pathlib.Path,
+                  out: pathlib.Path) -> None:
+    """The full split's training set re-sampled label-balanced.
+
+    The eval set is kept exactly: its document groups are excluded from every
+    pool. Each dataset keeps its training size from the full split's
+    manifest, drawn with label_balanced (labels equally likely, span-bearing
+    labels weighted SPAN_LABEL_WEIGHT) instead of the NO_SPAN_SHARE cap. All
+    of nimble-train is added. Rows longer than max_tokens are left out.
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-2B")
+    rng = random.Random(seed)
+    sizes = {k: v["train"] for k, v in
+             json.loads((full / "manifest.json").read_text())["datasets"].items()}
+    with open(full / "eval.jsonl") as f:
+        held = {json.loads(line)["group"] for line in f}
+    pools: dict[str, list[dict]] = collections.defaultdict(list)
+    for r in synthetic_rows():
+        pools[r["source"]].append(r)
+    for name, load in human.LOADERS.items():
+        pools[name] = load(random.Random(f"{seed}:{name}"))
+
+    def fits(r: dict) -> bool:
+        text = "".join(p["text"] for p in r["parts"]) + r["question"]
+        return len(tok(text)["input_ids"]) + 300 <= max_tokens
+
+    train: list[dict] = []
+    manifest = {"seed": seed, "max_tokens": max_tokens, "datasets": {}}
+    for name in sorted(pools):
+        rest = [r for r in pools[name]
+                if r["group"] not in held and fits(r)]
+        if name == "mqm":  # half 1-5 levels, half major-error yes/no
+            tr = []
+            for kind in ("score", "major_error"):
+                part = [r for r in rest if r["subset"].endswith(kind)]
+                tr += label_balanced(part, sizes[name] // 2, rng)
+        else:
+            tr = label_balanced(rest, sizes[name], rng)
+        train += tr
+        manifest["datasets"][name] = {
+            "pool": len(rest), "train": len(tr),
+            "with_spans": sum(bool(r["spans"]) for r in tr),
+            "labels": dict(collections.Counter(r["label"] for r in tr)),
+        }
+    with open(NIMBLE["train"]) as f:
+        keep = ("id", "source", "parts", "question", "labels", "label",
+                "spans", "segments")
+        nim = [{**{k: json.loads(line)[k] for k in keep}, "subset": "nimble",
+                "synthetic": True} for line in f]
+    nim = [r for r in nim if fits(r)]
+    train += nim
+    manifest["datasets"]["nimble_train"] = {"train": len(nim)}
+    rng.shuffle(train)
+    out.mkdir(parents=True, exist_ok=True)
+    with open(out / "train.jsonl", "w") as f:
+        for r in train:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    manifest["totals"] = {"train": len(train)}
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
+    print(json.dumps(manifest, indent=1))
+
+
 def main() -> None:
     """CLI."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -334,9 +401,15 @@ def main() -> None:
     parser.add_argument(
         "--small", action="store_true", help="build the small set (small())"
     )
-    parser.add_argument("--full", default="data/splits", help="for --small")
+    parser.add_argument("--full", default="data/splits",
+                        help="for --small / --balanced")
+    parser.add_argument("--balanced", action="store_true",
+                        help="re-sample the full training set label-balanced")
     args = parser.parse_args()
-    if args.small:
+    if args.balanced:
+        balanced_full(args.seed, args.max_tokens, pathlib.Path(args.full),
+                      pathlib.Path(args.out))
+    elif args.small:
         small(args.seed, pathlib.Path(args.full), pathlib.Path(args.out))
     else:
         build(args.seed, args.max_tokens, pathlib.Path(args.out))

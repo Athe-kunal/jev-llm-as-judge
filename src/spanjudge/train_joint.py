@@ -77,7 +77,36 @@ _TAIL = (
 
 
 ORDER = "doc_first"  # or "question_first"; set from --order
-HEAD = "cross"  # or "evidence" (EvidenceHead, doc_first only); from --head
+HEAD = "cross"  # cross / evidence / evspan / match; from --head
+# Yes/no questions answered with the codes Y / N instead of A / B (in a fixed
+# order, not shuffled); from --yes-no-codes, off for every earlier run.
+YES_NO = False
+_YES_NO_SETS = ({"yes": "Y", "no": "N"}, {"true": "Y", "false": "N"})
+# Heads that also encode the question without the document (doc_first only).
+ISO_HEADS = ("evidence", "evspan", "match")
+# DeFormer-style split (Cao et al. 2020), from --deformer: the top DEFORMER
+# layers read [question ; document] (question first); the layers below read
+# the question and the document separately, so the document's lower layers
+# can be cached and reused across questions. 0 = off (one ordinary pass).
+DEFORMER = 0
+
+
+def yes_no_codes(row: dict[str, Any]) -> dict[str, str] | None:
+    """{label: "Y" / "N"} for a yes/no row when YES_NO is on, else None."""
+    if not YES_NO:
+        return None
+    for m in _YES_NO_SETS:
+        if set(row["labels"]) == set(m):
+            return m
+    return None
+
+
+def choice_letters(row: dict[str, Any], order: list[str]) -> list[str]:
+    """The code letter of each choice, in prompt order."""
+    yn = yes_no_codes(row)
+    if yn:
+        return [yn[label] for label in order]
+    return list(string.ascii_uppercase[: len(order)])
 
 
 def question_block(
@@ -86,7 +115,7 @@ def question_block(
     """The question and lettered choices, and each choice line's range."""
     text = f"Question: {row['question']}\nChoices:\n"
     ranges = []
-    for code, label in zip(string.ascii_uppercase, order, strict=False):
+    for code, label in zip(choice_letters(row, order), order, strict=True):
         line = f"{code}. {row['labels'][label]}\n"
         ranges.append((len(text), len(text) + len(line) - 1))
         text += line
@@ -149,7 +178,10 @@ def char_targets(row: dict[str, Any]) -> dict[str, list[float]]:
 def encode(row: dict[str, Any], tokenizer: Any, rng: random.Random | None):
     """Token ids, gold code, document mask, span targets, question mask."""
     order = list(row["labels"])
-    if rng is not None:
+    yn = yes_no_codes(row)
+    if yn:  # fixed order: Y first
+        order = sorted(order, key=lambda label: yn[label] != "Y")
+    elif rng is not None:
         rng.shuffle(order)
     text, where, (q_start, q_end) = build_prompt(row, order)
     enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
@@ -169,12 +201,24 @@ def encode(row: dict[str, Any], tokenizer: Any, rng: random.Random | None):
         "input_ids": enc["input_ids"],
         "gold": order.index(row["label"]),
         "n_choices": len(order),
+        # each choice's code as an index into A..Z (code_ids order)
+        "letters": [string.ascii_uppercase.index(c)
+                    for c in choice_letters(row, order)],
         "doc": doc,
         "target": target,
         "question": question,
     }
-    if HEAD == "evidence":
-        # The question and choices without the document (strict final answer)
+    if DEFORMER:
+        # Lower layers: [system ; question] and [system ; document ; tail]
+        # separately. split = first token of the document segment.
+        offs = enc["offset_mapping"]
+        cuts = (len(_HEAD), q_end + 1)
+        if any(a < c < b for a, b in offs for c in cuts):
+            raise ValueError(f"{row['id']}: a token crosses a segment boundary")
+        ex["head_len"] = sum(b <= cuts[0] for _, b in offs)
+        ex["split"] = sum(b <= cuts[1] for _, b in offs)
+    if HEAD in ISO_HEADS:
+        # The question and choices without the document
         block, ranges = question_block(row, order)
         start = len(_HEAD)
         iso = tokenizer(_HEAD + block + _TAIL, add_special_tokens=False,
@@ -293,8 +337,8 @@ class EvidenceHead(nn.Module):
         self.final = nn.Sequential(nn.Linear(2 * dim, dim), nn.GELU(),
                                    nn.Linear(dim, dim))
 
-    def forward(self, h_doc, h_q, i_q, i_choices, draft_p):
-        """Span logits (n_doc,) and final answer logits (n_choices,)."""
+    def spans(self, h_doc, h_q, i_choices, draft_p):
+        """Span logits (n_doc,) from the span blocks alone (no reader)."""
         c = self.iso(i_choices)  # (k, dim)
         mem = torch.cat([self.mem(h_q), (draft_p.unsqueeze(1) * c).sum(0, True)])
         x = self.doc(h_doc)
@@ -303,7 +347,12 @@ class EvidenceHead(nn.Module):
             y = b["n2"](x)
             x = x + b["self"](y, y)
             x = x + b["ff"](b["n3"](x))
-        span = self.span(x).squeeze(-1)
+        return self.span(x).squeeze(-1)
+
+    def forward(self, h_doc, h_q, i_q, i_choices, draft_p):
+        """Span logits (n_doc,) and final answer logits (n_choices,)."""
+        c = self.iso(i_choices)  # (k, dim)
+        span = self.spans(h_doc, h_q, i_choices, draft_p)
         q_tok = self.iso(i_q)
         query = q_tok.mean(0, keepdim=True)
         bias = nn.functional.logsigmoid(span)  # log p(evidence)
@@ -322,6 +371,98 @@ class EvidenceHead(nn.Module):
         return span, (z @ c.T).squeeze(0) / c.shape[-1] ** 0.5
 
 
+class MatchHead(nn.Module):
+    """GLiNER-style matching with ColBERT-style late interaction.
+
+    Document tokens (document-first pass, cacheable) get one bidirectional
+    self-attention block inside the head; the question's tokens and the
+    answer choices are encoded without the document. Evidence logit per
+    document token = a learned mix of:
+      match: soft maximum over question tokens of the cosine similarity
+        (temperature-scaled logsumexp; ColBERT's MaxSim made soft);
+      pick: log of how much attention the question tokens give it, each
+        question token spreading a softmax over the document (each query
+        token picks the document tokens it is interested in);
+      answer: similarity to the answer choices weighted by the LM letter's
+        probabilities (GLiNER's label matching, for the model's own answer);
+      prior: a linear score of the token alone (lets error-finding tasks,
+        whose evidence shares no words with the question, learn something).
+    Everything is soft; the answer itself stays the LM letter.
+    """
+
+    def __init__(self, hidden: int, dim: int = 512, heads: int = 8):
+        super().__init__()
+        self.doc, self.q, self.c = (nn.Linear(hidden, dim) for _ in range(3))
+        self.n1, self.n2 = nn.LayerNorm(dim), nn.LayerNorm(dim)
+        self.self_attn = _Attn(dim, heads)
+        self.ff = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(),
+                                nn.Linear(4 * dim, dim))
+        self.kd, self.kq, self.kg = (nn.Linear(dim, dim) for _ in range(3))
+        self.scale = nn.Parameter(torch.tensor(math.log(10.0)))
+        self.prior = nn.Linear(dim, 1)
+        self.mix = nn.Linear(3, 1)
+
+    def forward(self, h_doc, i_q, i_choices, draft_p):
+        """Span logits (n_doc,)."""
+        x = self.doc(h_doc)
+        y = self.n1(x)
+        x = x + self.self_attn(y, y)
+        x = x + self.ff(self.n2(x))
+        q = self.q(i_q)
+        s = self.scale.exp()
+        sim = (nn.functional.normalize(self.kd(x), dim=-1)
+               @ nn.functional.normalize(self.kq(q), dim=-1).T) * s  # (n, m)
+        match = torch.logsumexp(sim, 1) - math.log(sim.shape[1])
+        pick = torch.log(torch.softmax(sim, 0).sum(1) + 1e-6)
+        c = nn.functional.normalize(self.c(i_choices), dim=-1)  # (k, dim)
+        g = (nn.functional.normalize(self.kg(x), dim=-1) @ c.T) * s  # (n, k)
+        answer = g @ draft_p
+        feats = torch.stack([match, pick, answer], -1)
+        return (self.mix(feats) + self.prior(x)).squeeze(-1)
+
+
+def build_head(hidden: int, args: dict) -> nn.Module:
+    """The span head named by HEAD, with the run's arguments."""
+    if HEAD in ("evidence", "evspan"):
+        return EvidenceHead(hidden, layers=args.get("head_layers", 2),
+                            reader_layers=args.get("reader_layers", 0))
+    if HEAD == "match":
+        return MatchHead(hidden)
+    return SpanHead(hidden)
+
+
+def load_base(model_id: str, revision: str, bidirectional: bool = False):
+    """The base LLM in bf16 on the current device's default (CPU).
+
+    Qwen3.5 is loaded with its multimodal class (as in every earlier run);
+    other models (e.g. Qwen3) with AutoModelForCausalLM. bidirectional:
+    every token attends to every token (config.is_causal = False makes
+    transformers build a bidirectional padding mask, and the attention
+    modules' own causal flag is turned off so SDPA never falls back to a
+    causal mask). Only for models whose layers are all full attention.
+    """
+    from transformers import AutoModelForCausalLM
+    from transformers import Qwen3_5ForConditionalGeneration
+
+    cls = (Qwen3_5ForConditionalGeneration if "Qwen3.5" in model_id
+           else AutoModelForCausalLM)
+    model = cls.from_pretrained(model_id, revision=revision,
+                                dtype=torch.bfloat16,
+                                attn_implementation="sdpa")
+    if bidirectional:
+        types = set(getattr(model.config.get_text_config(), "layer_types",
+                            None) or ["full_attention"])
+        if types != {"full_attention"}:
+            raise ValueError(f"{model_id} has {types} layers; bidirectional "
+                             "attention needs full attention everywhere")
+        model.config.is_causal = False
+        model.config.get_text_config().is_causal = False
+        for m in model.modules():
+            if hasattr(m, "is_causal"):
+                m.is_causal = False
+    return model
+
+
 def _hidden(model, ids, device, ckpt_tokens, logits=True):
     if len(ids) > ckpt_tokens:
         model.gradient_checkpointing_enable(
@@ -338,12 +479,13 @@ def forward(
 ):
     """Answer logits, span logits, and the draft (LM letter) logits.
 
-    With the cross head the answer is the LM letter and the draft is None.
-    With the evidence head the answer is the head's final answer.
+    With the cross, evspan and match heads the answer is the LM letter and
+    the draft is None. With the evidence head the answer is the head's final
+    answer and the draft is the LM letter.
     """
-    if HEAD == "evidence":
+    if HEAD in ISO_HEADS:
         out = _hidden(model, ex["input_ids"], device, ckpt_tokens)
-        draft = out.logits[0, -1].float()[codes[: ex["n_choices"]]]
+        draft = out.logits[0, -1].float()[[codes[i] for i in ex["letters"]]]
         hidden = out.hidden_states[-1][0].float()
         iso = _hidden(model, ex["iso_ids"], device, ckpt_tokens)
         ih = iso.hidden_states[-1][0].float()
@@ -351,8 +493,12 @@ def forward(
         question = torch.tensor(ex["question"], device=device)
         i_q = ih[torch.tensor(ex["iso_q"], device=device)]
         i_c = torch.stack([ih[idx].mean(0) for idx in ex["iso_choices"]])
-        span, final = head(hidden[doc], hidden[question], i_q, i_c,
-                           torch.softmax(draft, -1))
+        p = torch.softmax(draft, -1)
+        if HEAD == "evspan":
+            return draft, head.spans(hidden[doc], hidden[question], i_c, p), None
+        if HEAD == "match":
+            return draft, head(hidden[doc], i_q, i_c, p), None
+        span, final = head(hidden[doc], hidden[question], i_q, i_c, p)
         return final, span, draft
     if len(ex["input_ids"]) > ckpt_tokens:
         model.gradient_checkpointing_enable(
@@ -360,22 +506,161 @@ def forward(
         )
     elif model.training:
         model.gradient_checkpointing_disable()
-    ids = torch.tensor([ex["input_ids"]], device=device)
-    out = model(
-        input_ids=ids,
-        output_hidden_states=True,
-        logits_to_keep=1,
-        use_cache=False,
-    )
-    logits = out.logits[0, -1].float()[codes[: ex["n_choices"]]]
-    hidden = out.hidden_states[-1][0].float()
+    if DEFORMER:
+        hs, lg = _deformer_hidden(model, [ex], device, 0)
+        logits = lg[0][[codes[i] for i in ex["letters"]]]
+        hidden = hs[0]
+    else:
+        ids = torch.tensor([ex["input_ids"]], device=device)
+        out = model(
+            input_ids=ids,
+            output_hidden_states=True,
+            logits_to_keep=1,
+            use_cache=False,
+        )
+        logits = out.logits[0, -1].float()[[codes[i] for i in ex["letters"]]]
+        hidden = out.hidden_states[-1][0].float()
     doc = torch.tensor(ex["doc"], device=device)
     question = torch.tensor(ex["question"], device=device)
     span = head(hidden[doc], hidden[question])
     return logits, span, None
 
 
-def code_logits(model, ids: list[int], codes: list[int], n: int,
+def _batched_hidden(model, seqs: list[list[int]], device: str, pad: int):
+    """Last-layer states and last-position logits for several sequences.
+
+    Left padding: the linear-attention layers zero padded inputs, the
+    full-attention layers get the padding mask, and position ids skip the
+    padding, so each row matches a batch-of-one forward up to bf16 rounding.
+    Returns per-row hidden states (padding removed) and logits.
+    """
+    n = max(len(x) for x in seqs)
+    ids = torch.full((len(seqs), n), pad, dtype=torch.long)
+    mask = torch.zeros((len(seqs), n), dtype=torch.long)
+    for i, x in enumerate(seqs):
+        ids[i, n - len(x):] = torch.tensor(x)
+        mask[i, n - len(x):] = 1
+    ids, mask = ids.to(device), mask.to(device)
+    pos = (mask.cumsum(-1) - 1).clamp(min=0)
+    # The language model alone gives only the last layer (all 25 layers'
+    # states would be kept with output_hidden_states); LoRA stays active.
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    out = base.model(input_ids=ids, attention_mask=mask, position_ids=pos,
+                     use_cache=False)
+    last = out.last_hidden_state
+    logits = base.lm_head(last[:, -1]).float()
+    last = last.float()
+    return [last[i, n - len(x):] for i, x in enumerate(seqs)], logits
+
+
+def _layers(lm, h, mask, lo: int, hi: int):
+    """lm.layers[lo:hi] on states h (batch, n, H), as the text model's own
+    forward runs them; mask: 2D left-padding mask or None (no padding)."""
+    from transformers.masking_utils import create_causal_mask
+    from transformers.masking_utils import create_recurrent_attention_mask
+
+    if mask is None:
+        pos = torch.arange(h.shape[1], device=h.device)[None].expand(h.shape[0], -1)
+    else:
+        pos = (mask.cumsum(-1) - 1).clamp(min=0)
+    kw = dict(config=lm.config, inputs_embeds=h, attention_mask=mask,
+              past_key_values=None, position_ids=pos)
+    masks = {"full_attention": create_causal_mask(**kw),
+             "linear_attention": create_recurrent_attention_mask(**kw)}
+    emb = lm.rotary_emb(h, pos[None].expand(3, -1, -1))
+    for i in range(lo, hi):
+        h = lm.layers[i](h, position_embeddings=emb,
+                         attention_mask=masks[lm.config.layer_types[i]],
+                         position_ids=pos, past_key_values=None,
+                         use_cache=False)
+    return h
+
+
+def _left_pad(xs: list[torch.Tensor]):
+    """(batch, n, H) left-padded with zeros, and its 2D mask."""
+    n = max(x.shape[0] for x in xs)
+    h = xs[0].new_zeros((len(xs), n, xs[0].shape[-1]))
+    mask = torch.zeros((len(xs), n), dtype=torch.long, device=h.device)
+    for i, x in enumerate(xs):
+        h[i, n - x.shape[0]:] = x
+        mask[i, n - x.shape[0]:] = 1
+    return h, mask
+
+
+def _deformer_hidden(model, exs: list[dict], device: str, pad: int):
+    """_batched_hidden with the DeFormer split.
+
+    Lower layers: [system ; question] and [system ; document ; tail] as two
+    sequences (the second is question-independent); top DEFORMER layers: the
+    question states, then the document segment's states without its system
+    prefix, i.e. the question-first prompt. With DEFORMER = all layers this
+    is the ordinary question-first forward.
+    """
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    lm = base.model.language_model
+    top = lm.config.num_hidden_layers
+    lo = top - DEFORMER
+    one = len(exs) == 1  # training: no padding, no mask
+
+    def lower(seqs):
+        embs = [lm.embed_tokens(torch.tensor(s, device=device)) for s in seqs]
+        if one:
+            return [_layers(lm, embs[0][None], None, 0, lo)[0]]
+        h, mask = _left_pad(embs)
+        h = _layers(lm, h, mask, 0, lo)
+        return [h[i, h.shape[1] - len(s):] for i, s in enumerate(seqs)]
+
+    qs = lower([e["input_ids"][:e["split"]] for e in exs])
+    ds = lower([e["input_ids"][:e["head_len"]] + e["input_ids"][e["split"]:]
+                for e in exs])
+    joint = [torch.cat([q, d[e["head_len"]:]]) for q, d, e in
+             zip(qs, ds, exs, strict=True)]
+    if one:
+        h = _layers(lm, joint[0][None], None, lo, top)
+    else:
+        h, mask = _left_pad(joint)
+        h = _layers(lm, h, mask, lo, top)
+    h = lm.norm(h)
+    logits = base.lm_head(h[:, -1]).float()
+    h = h.float()
+    return [h[i, h.shape[1] - len(x):] for i, x in enumerate(joint)], logits
+
+
+def forward_batch(model, head, exs: list[dict], codes: list[int],
+                  device: str, pad: int):
+    """forward() for several encoded rows at once (inference only)."""
+    if DEFORMER:
+        hidden, logits = _deformer_hidden(model, exs, device, pad)
+    else:
+        hidden, logits = _batched_hidden(model, [e["input_ids"] for e in exs],
+                                         device, pad)
+    if HEAD in ISO_HEADS:
+        iso, _ = _batched_hidden(model, [e["iso_ids"] for e in exs], device,
+                                 pad)
+    out = []
+    for i, ex in enumerate(exs):
+        h = hidden[i]
+        lg = logits[i][[codes[j] for j in ex["letters"]]]
+        doc = torch.tensor(ex["doc"], device=device)
+        question = torch.tensor(ex["question"], device=device)
+        if HEAD in ISO_HEADS:
+            ih = iso[i]
+            i_q = ih[torch.tensor(ex["iso_q"], device=device)]
+            i_c = torch.stack([ih[idx].mean(0) for idx in ex["iso_choices"]])
+            p = torch.softmax(lg, -1)
+            if HEAD == "evspan":
+                out.append((lg, head.spans(h[doc], h[question], i_c, p), None))
+            elif HEAD == "match":
+                out.append((lg, head(h[doc], i_q, i_c, p), None))
+            else:
+                span, final = head(h[doc], h[question], i_q, i_c, p)
+                out.append((final, span, lg))
+        else:
+            out.append((lg, head(h[doc], h[question]), None))
+    return out
+
+
+def code_logits(model, ids: list[int], codes: list[int], letters: list[int],
                 device: str, ckpt_tokens: int) -> torch.Tensor:
     """Answer-code logits for a token sequence (no span head)."""
     if len(ids) > ckpt_tokens:
@@ -386,7 +671,7 @@ def code_logits(model, ids: list[int], codes: list[int], n: int,
         model.gradient_checkpointing_disable()
     out = model(input_ids=torch.tensor([ids], device=device),
                 logits_to_keep=1, use_cache=False)
-    return out.logits[0, -1].float()[codes[:n]]
+    return out.logits[0, -1].float()[[codes[i] for i in letters]]
 
 
 def reduced(ex: dict, span: torch.Tensor) -> tuple[list, list, int]:
@@ -431,7 +716,7 @@ def selfcite(model, ex: dict, span: torch.Tensor, draft: torch.Tensor,
             lp = []
             for kept in (keep, [not x for x in keep]):
                 ids = subset(ex, kept)["input_ids"]
-                lg = code_logits(model, ids, codes, ex["n_choices"], device,
+                lg = code_logits(model, ids, codes, ex["letters"], device,
                                  ckpt_tokens)
                 lp.append(torch.log_softmax(lg, -1)[y])
             rewards.append(lp[0] - lp[1])
@@ -589,8 +874,19 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument(
-        "--head", choices=["cross", "evidence"], default="cross",
-        help="evidence: draft -> spans -> strict final answer (doc_first)")
+        "--yes-no-codes", action="store_true",
+        help="answer yes/no (and true/false) questions with Y / N")
+    parser.add_argument("--model", default=MODEL_ID)
+    parser.add_argument("--revision", default=REVISION)
+    parser.add_argument(
+        "--bidirectional", action="store_true",
+        help="every token attends to every token (all-full-attention models)")
+    parser.add_argument(
+        "--head", choices=["cross", "evidence", "evspan", "match"],
+        default="cross",
+        help="evidence: draft -> spans -> strict final answer; evspan: its "
+        "span blocks only (LM letter answer); match: GLiNER + ColBERT "
+        "(LM letter answer); the last three need --order doc_first")
     parser.add_argument("--head-layers", type=int, default=2)
     parser.add_argument("--draft-weight", type=float, default=1.0)
     parser.add_argument("--reader-layers", type=int, default=0,
@@ -617,11 +913,21 @@ def main() -> None:
         action="store_true",
         help="skip the full eval after each epoch (checkpoints still saved)",
     )
+    parser.add_argument(
+        "--deformer", type=int, default=0,
+        help="top layers that read [question ; document] jointly; the lower "
+        "ones read them separately (cacheable document). Needs --order "
+        "question_first and --head cross; 0 = off")
     args = parser.parse_args()
-    global ORDER, HEAD
-    ORDER, HEAD = args.order, args.head
-    if HEAD == "evidence" and ORDER != "doc_first":
-        raise ValueError("the evidence head needs --order doc_first")
+    global ORDER, HEAD, YES_NO, DEFORMER
+    ORDER, HEAD, YES_NO = args.order, args.head, args.yes_no_codes
+    DEFORMER = args.deformer
+    if HEAD in ISO_HEADS and ORDER != "doc_first":
+        raise ValueError(f"the {HEAD} head needs --order doc_first")
+    if DEFORMER and (ORDER != "question_first" or HEAD != "cross"
+                     or args.consistency or args.selfcite):
+        raise ValueError("--deformer needs --order question_first, --head "
+                         "cross, and no --consistency / --selfcite")
     if args.consistency and HEAD == "evidence":
         raise ValueError("--consistency is for the cross head; use --selfcite")
 
@@ -629,7 +935,6 @@ def main() -> None:
     from peft import get_peft_model
     from torch.utils.tensorboard import SummaryWriter
     from transformers import AutoTokenizer
-    from transformers import Qwen3_5ForConditionalGeneration
 
     world = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("RANK", 0))
@@ -651,13 +956,13 @@ def main() -> None:
                 {
                     **vars(args),
                     "gpus": world,
-                    "model": MODEL_ID,
-                    "revision": REVISION,
+                    "model": args.model,
+                    "revision": args.revision,
                 },
                 indent=2,
             )
         )
-    tok = AutoTokenizer.from_pretrained(MODEL_ID, revision=REVISION)
+    tok = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
     codes = code_ids(tok)
     with open(args.train) as f:
         train = [json.loads(line) for line in f]
@@ -665,17 +970,14 @@ def main() -> None:
         evals = [json.loads(line) for line in f]
     small_eval = eval_subset(evals, args.eval_subset, args.seed)
 
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(
-        MODEL_ID,
-        revision=REVISION,
-        dtype=torch.bfloat16,
-        attn_implementation="sdpa",
-    ).to(device)
+    model = load_base(args.model, args.revision, args.bidirectional).to(device)
     model.config.use_cache = False
+    # LoRA on the language model's linear layers (not the vision tower or
+    # the output head)
     targets = [
         n
         for n, m in model.named_modules()
-        if isinstance(m, nn.Linear) and ".language_model." in n
+        if isinstance(m, nn.Linear) and ".layers." in n and "visual" not in n
     ]
     model = get_peft_model(
         model,
@@ -690,10 +992,7 @@ def main() -> None:
     )
     model.enable_input_require_grads()
     hidden = model.config.get_text_config().hidden_size
-    head = (EvidenceHead(hidden, layers=args.head_layers,
-                         reader_layers=args.reader_layers)
-            if HEAD == "evidence"
-            else SpanHead(hidden)).to(device)
+    head = build_head(hidden, vars(args)).to(device)
     lora = [p for p in model.parameters() if p.requires_grad]
     params = lora + list(head.parameters())
     opt = torch.optim.AdamW(
@@ -807,7 +1106,7 @@ def main() -> None:
                 ):
                     only, drop, n_sel = reduced(ex, span)
                     if n_sel:
-                        n = ex["n_choices"]
+                        n = ex["letters"]
                         gold = torch.tensor([ex["gold"]], device=device)
                         suff = nn.functional.cross_entropy(
                             code_logits(model, only, codes, n, device,

@@ -65,40 +65,37 @@ class _Model:
     def __init__(self, checkpoint: str, order: str):
         from peft import PeftModel
         from transformers import AutoTokenizer
-        from transformers import Qwen3_5ForConditionalGeneration
 
         # the run's own order and head (args.json next to the checkpoints)
         run_args = pathlib.Path(checkpoint).parent.parent / "args.json"
         args = json.loads(run_args.read_text()) if run_args.exists() else {}
         train_joint.ORDER = args.get("order", order)
         train_joint.HEAD = args.get("head", "cross")
-        self.tok = AutoTokenizer.from_pretrained(
-            train_joint.MODEL_ID, revision=train_joint.REVISION
-        )
+        train_joint.YES_NO = args.get("yes_no_codes", False)
+        train_joint.DEFORMER = args.get("deformer", 0)
+        model_id = args.get("model", train_joint.MODEL_ID)
+        revision = args.get("revision", train_joint.REVISION)
+        self.tok = AutoTokenizer.from_pretrained(model_id, revision=revision)
         self.codes = train_joint.code_ids(self.tok)
-        base = Qwen3_5ForConditionalGeneration.from_pretrained(
-            train_joint.MODEL_ID,
-            revision=train_joint.REVISION,
-            dtype=torch.bfloat16,
-            attn_implementation="sdpa",
+        base = train_joint.load_base(
+            model_id, revision, args.get("bidirectional", False)
         ).to("cuda")
         self.model = PeftModel.from_pretrained(
             base, f"{checkpoint}/adapter"
         ).eval()
         hidden = self.model.config.get_text_config().hidden_size
-        self.head = (
-            train_joint.EvidenceHead(hidden, layers=args.get("head_layers", 2),
-                                     reader_layers=args.get("reader_layers", 0))
-            if train_joint.HEAD == "evidence"
-            else train_joint.SpanHead(hidden)
-        ).to("cuda").eval()
+        self.head = train_joint.build_head(hidden, args).to("cuda").eval()
         self.head.load_state_dict(
             torch.load(f"{checkpoint}/span_head.pt", map_location="cuda")
         )
         self.lock = threading.Lock()
 
     def predict(self, row: dict[str, Any]) -> dict[str, Any]:
-        """Answer probabilities and per-token evidence probabilities."""
+        """Answer probabilities and per-token evidence probabilities.
+
+        The answer shown is the LM letter (with the evidence head, its
+        draft); the evidence head's strict reader is returned as "reader".
+        """
         order = list(row["labels"])
         ex = train_joint.encode(row, self.tok, None)
         text, where, _ = train_joint.build_prompt(row, order)
@@ -106,9 +103,15 @@ class _Model:
             text, add_special_tokens=False, return_offsets_mapping=True
         )["offset_mapping"]
         with self.lock, torch.no_grad():
-            logits, span, _ = train_joint.forward(
+            logits, span, draft = train_joint.forward(
                 self.model, self.head, ex, self.codes, "cuda", 10**9
             )
+        reader = None
+        if draft is not None:
+            rp = torch.softmax(logits, -1).tolist()
+            reader = {"label": order[int(torch.tensor(rp).argmax())],
+                      "probs": dict(zip(order, rp, strict=True))}
+            logits = draft
         probs = torch.softmax(logits, -1).tolist()
         span_p = torch.sigmoid(span).tolist()
         tokens: dict[str, list] = {name: [] for name in where}
@@ -126,6 +129,7 @@ class _Model:
             "probs": dict(zip(order, probs, strict=True)),
             "tokens": tokens,
             "n_tokens": len(ex["input_ids"]),
+            "reader": reader,
         }
 
 

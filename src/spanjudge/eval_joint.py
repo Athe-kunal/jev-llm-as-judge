@@ -34,8 +34,28 @@ import torch
 from spanjudge import train_joint
 
 
-def predict(checkpoint: str, data: str, out: str, shard: str, order: str):
-    """Writes one prediction per row of this shard to <out>/shard-i.jsonl."""
+def _batches(exs: list, budget: int, cap: int = 64) -> list[list]:
+    """Groups items sorted by length so a batch stays under `budget` tokens
+    of padded input (and at most `cap` rows)."""
+    exs = sorted(exs, key=lambda x: len(x[1]["input_ids"]))
+    out, cur = [], []
+    for x in exs:
+        n = len(x[1]["input_ids"])
+        if cur and ((len(cur) + 1) * n > budget or len(cur) == cap):
+            out.append(cur)
+            cur = []
+        cur.append(x)
+    return out + ([cur] if cur else [])
+
+
+def predict(checkpoint: str, data: str, out: str, shard: str, order: str,
+            batch_tokens: int = 8192, chunk: int = 512):
+    """Writes one prediction per row of this shard to <out>/shard-i.jsonl.
+
+    Rows are processed `chunk` at a time; within a chunk, rows and then
+    their ablations run in length-sorted batches of up to `batch_tokens`
+    padded tokens (train_joint.forward_batch).
+    """
     from spanjudge.joint_viz import _Model
 
     i, n = map(int, shard.split("/"))
@@ -47,63 +67,81 @@ def predict(checkpoint: str, data: str, out: str, shard: str, order: str):
     if path.exists():
         with open(path) as f:
             done = {json.loads(line)["id"] for line in f}
+    rows = [r for r in rows if r["id"] not in done]
     model = _Model(checkpoint, order)
-    with open(path, "a") as f:
-        for row in rows:
-            if row["id"] in done:
-                continue
-            labels = list(row["labels"])
-            ex = train_joint.encode(row, model.tok, None)
-            with torch.no_grad():
-                logits, span, draft = train_joint.forward(
-                    model.model, model.head, ex, model.codes, "cuda", 10**9
-                )
-            probs = torch.softmax(logits, -1).tolist()
-            pred = (torch.sigmoid(span) > 0.5).cpu().tolist()
-            gold = [
-                t >= 0.5
-                for t, d in zip(ex["target"], ex["doc"], strict=True)
-                if d
-            ]
-            y = max(range(len(probs)), key=probs.__getitem__)
-            # Ablations rerun the whole model (and head) on the shortened
-            # prompt, so they measure the answer the model reports.
-            chosen = (torch.sigmoid(span) >= 0.5).cpu().tolist()
-            n_sel = sum(chosen)
-            faith = {}
-            if n_sel:
-                def p_y(keep):
-                    with torch.no_grad():
-                        lg, _, _ = train_joint.forward(
-                            model.model, model.head,
-                            train_joint.subset(ex, keep), model.codes,
-                            "cuda", 10**9)
-                    return torch.softmax(lg, -1)[y].item()
+    pad = model.tok.pad_token_id if model.tok.pad_token_id is not None else 0
 
-                faith = {"p_only": p_y(chosen),
-                         "p_drop": p_y([not c for c in chosen])}
-                # random baseline: the same number of random document tokens
-                pick = set(random.Random(row["id"]).sample(
-                    range(len(chosen)), n_sel))
+    def run(items):
+        """{key: (answer logits, span logits, draft logits)} for (key, ex)."""
+        res = {}
+        with torch.no_grad():
+            for b in _batches(items, batch_tokens):
+                outs = train_joint.forward_batch(
+                    model.model, model.head, [ex for _, ex in b], model.codes,
+                    "cuda", pad)
+                for (key, _), o in zip(b, outs, strict=True):
+                    res[key] = o
+        return res
+
+    with open(path, "a") as f:
+        for c in range(0, len(rows), chunk):
+            part = rows[c:c + chunk]
+            exs = {r["id"]: train_joint.encode(r, model.tok, None) for r in part}
+            main = run(list(exs.items()))
+            # Ablations rerun the whole model (and head) on the shortened
+            # prompt, so they measure the answer the model reports; with the
+            # evidence head also the draft (the LM letter SelfCite trains on).
+            abl, info = [], {}
+            for r in part:
+                ex = exs[r["id"]]
+                logits, span, draft = main[r["id"]]
+                chosen = (torch.sigmoid(span) >= 0.5).cpu().tolist()
+                n_sel = sum(chosen)
+                info[r["id"]] = (chosen, n_sel)
+                if not n_sel:
+                    continue
+                pick = set(random.Random(r["id"]).sample(range(len(chosen)), n_sel))
                 rand = [k in pick for k in range(len(chosen))]
-                faith["p_only_random"] = p_y(rand)
-                faith["p_drop_random"] = p_y([not c for c in rand])
-            rec = {
-                "id": row["id"],
-                "source": row["source"],
-                "gold": row["label"],
-                "pred": labels[max(range(len(probs)), key=probs.__getitem__)],
-                "probs": dict(zip(labels, probs, strict=True)),
-                "span_tp": sum(p and g for p, g in zip(pred, gold, strict=True)),
-                "span_pred": sum(pred),
-                "span_gold": sum(gold),
-                **({"draft_probs": dict(zip(labels, torch.softmax(draft, -1).tolist(), strict=True))}
-                   if draft is not None else {}),
-                "n_selected": n_sel,
-                "n_doc": sum(ex["doc"]),
-                **faith,
-            }
-            f.write(json.dumps(rec) + "\n")
+                for name, keep in (("only", chosen),
+                                   ("drop", [not x for x in chosen]),
+                                   ("only_random", rand),
+                                   ("drop_random", [not x for x in rand])):
+                    abl.append(((r["id"], name), train_joint.subset(ex, keep)))
+            ablated = run(abl)
+            for r in part:
+                ex = exs[r["id"]]
+                labels = list(r["labels"])
+                logits, span, draft = main[r["id"]]
+                probs = torch.softmax(logits, -1).tolist()
+                y = max(range(len(probs)), key=probs.__getitem__)
+                y_d = None if draft is None else int(draft.argmax())
+                pred = (torch.sigmoid(span) > 0.5).cpu().tolist()
+                gold = [t >= 0.5 for t, d in zip(ex["target"], ex["doc"],
+                                                 strict=True) if d]
+                chosen, n_sel = info[r["id"]]
+                faith = {}
+                if n_sel:
+                    for name in ("only", "drop", "only_random", "drop_random"):
+                        lg, _, dr = ablated[(r["id"], name)]
+                        faith[f"p_{name}"] = torch.softmax(lg, -1)[y].item()
+                        if dr is not None:
+                            faith[f"pd_{name}"] = torch.softmax(dr, -1)[y_d].item()
+                rec = {
+                    "id": r["id"],
+                    "source": r["source"],
+                    "gold": r["label"],
+                    "pred": labels[y],
+                    "probs": dict(zip(labels, probs, strict=True)),
+                    "span_tp": sum(a and g for a, g in zip(pred, gold, strict=True)),
+                    "span_pred": sum(pred),
+                    "span_gold": sum(gold),
+                    **({"draft_probs": dict(zip(labels, torch.softmax(draft, -1).tolist(), strict=True))}
+                       if draft is not None else {}),
+                    "n_selected": n_sel,
+                    "n_doc": sum(ex["doc"]),
+                    **faith,
+                }
+                f.write(json.dumps(rec) + "\n")
             f.flush()
 
 
@@ -175,6 +213,18 @@ def report(out: str) -> str:
         f"{avg([py(p) - p['p_only'] for p in fr]):.3f} ({avg([py(p) - p['p_only_random'] for p in fr]):.3f}) | "
         f"{avg([py(p) - p['p_drop'] for p in fr]):.3f} ({avg([py(p) - p['p_drop_random'] for p in fr]):.3f}) |"
     )
+    fd = [p for p in preds if "pd_only" in p]
+    if fd:
+        pyd = lambda p: max(p["draft_probs"].values())
+        summary += [
+            "",
+            "Draft answer (LM letter) faithfulness, same highlights: "
+            f"sufficiency {avg([pyd(p) - p['pd_only'] for p in fd]):.3f} "
+            f"(random {avg([pyd(p) - p['pd_only_random'] for p in fd]):.3f}), "
+            f"comprehensiveness {avg([pyd(p) - p['pd_drop'] for p in fd]):.3f} "
+            f"(random {avg([pyd(p) - p['pd_drop_random'] for p in fd]):.3f}); "
+            f"draft accuracy {avg([max(p['draft_probs'], key=p['draft_probs'].get) == p['gold'] for p in preds]):.3f}",
+        ]
     text = "\n".join(lines + summary + [""] + detail)
     (pathlib.Path(out) / "metrics.md").write_text(text)
     return text
@@ -188,12 +238,15 @@ def main() -> None:
     parser.add_argument("--data", default="data/splits/eval.jsonl")
     parser.add_argument("--out", required=True)
     parser.add_argument("--shard", default="0/1")
+    parser.add_argument("--batch-tokens", type=int, default=8192,
+                        help="padded tokens per forward batch")
     parser.add_argument(
         "--order", default="question_first", choices=["doc_first", "question_first"]
     )
     args = parser.parse_args()
     if args.stage == "predict":
-        predict(args.checkpoint, args.data, args.out, args.shard, args.order)
+        predict(args.checkpoint, args.data, args.out, args.shard, args.order,
+                args.batch_tokens)
     else:
         print(report(args.out))
 

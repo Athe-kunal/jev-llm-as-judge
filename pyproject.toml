@@ -19,6 +19,9 @@ dependencies = [
     "accelerate==1.15.0",
     "tensorboard",
     "flash-linear-attention==0.5.2",  # fast Gated DeltaNet for Qwen3.5
+    # Fast short convolution in Qwen3.5's linear-attention layers. Built from
+    # source against the installed torch: CUDA_HOME=/usr/local/cuda-12.6.
+    "causal-conv1d==1.5.3.post1",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +32,9 @@ dev = ["pytest", "hypothesis"]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
+
+[tool.uv]
+no-build-isolation-package = ["causal-conv1d"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
