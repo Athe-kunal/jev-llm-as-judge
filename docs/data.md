@@ -406,6 +406,9 @@ names are listed as options.
 
 ## 8. How to rebuild
 
+`make data` runs both steps below; `make data-view` browses 5 examples per
+dataset.
+
 ```bash
 # 1. fetch the pinned sources (skips files already present)
 PYTHONPATH=src .venv/bin/python -m spanjudge.reason_long --download
